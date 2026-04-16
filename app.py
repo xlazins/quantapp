@@ -69,15 +69,25 @@ with st.sidebar:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Fetching data from GitHub...")
+@st.cache_data(show_spinner="Fetching data...")
 def load_data(url: str, tf: str) -> pd.DataFrame:
+
+    def to_drive_direct(url):
+        if "drive.google.com/file/d/" in url:
+            file_id = url.split("/file/d/")[1].split("/")[0]
+            return f"https://drive.google.com/uc?export=download&id={file_id}"
+        return url
+
+    url = to_drive_direct(url)
     r = requests.get(url, timeout=30)
     r.raise_for_status()
 
-    raw = StringIO(r.text)
+    raw   = StringIO(r.text)
     first = r.text.splitlines()[0]
     sep   = "\t" if "\t" in first else ","
     df    = pd.read_csv(StringIO(r.text), sep=sep)
+
+    # ... rest of the function unchanged
 
     # ── Timestamp ─────────────────────────────────────────────────────────────
     # Handle separate Date + Time columns (common in NQ exports)
@@ -439,7 +449,8 @@ def render_results(results: pd.DataFrame):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if run_btn:
-    if not github_url.startswith("https://raw.githubusercontent.com"):
+    if not (github_url.startswith("https://raw.githubusercontent.com") or 
+        github_url.startswith("https://drive.google.com")):
         st.error("Please enter a valid GitHub **raw** URL (starts with https://raw.githubusercontent.com/...)")
         st.stop()
 
