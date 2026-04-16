@@ -21,10 +21,10 @@ st.caption("Define your range window, entry logic, and risk parameters in the si
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    github_url = st.text_input(
-        "GitHub Raw CSV URL",
-        value="https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/5minnqdata.csv",
-        help="Paste the raw URL from your GitHub repo (click Raw on the file page)."
+    uploaded_file = st.file_uploader(
+        "Upload CSV File",
+        type=["csv", "txt"],
+        help="Upload your NQ data file directly."
     )
 
     st.divider()
@@ -69,23 +69,65 @@ with st.sidebar:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Fetching data...")
-def load_data(url: str, tf: str) -> pd.DataFrame:
+@st.cache_data(show_spinner="Loading data...")
+def load_data(file_bytes: bytes, tf: str) -> pd.DataFrame:
 
-    def to_drive_direct(url):
-        if "drive.google.com/file/d/" in url:
-            file_id = url.split("/file/d/")[1].split("/")[0]
-            return f"https://drive.google.com/uc?export=download&id={file_id}"
-        return url
+    content = file_bytes.decode("utf-8")
+    first   = content.splitlines()[0]
+    sep     = "\t" if "\t" in first else ","
 
-    url = to_drive_direct(url)
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
+    df = pd.read_csv(StringIO(content), sep=sep, on_bad_lines="skip")
+    df.columns = df.columns.str.strip().str.lower()
 
-    first = r.text.splitlines()[0]
-    sep   = "\t" if "\t" in first else ","
+    # ── Filter to front-month symbol if multi-symbol ───────────────────
+    if "symbol" in df.columns:
+        top_symbol = df["symbol"].value_counts().idxmax()
+        df = df[df["symbol"] == top_symbol].copy()
 
-    df = pd.read_csv(StringIO(r.text), sep=sep, on_bad_lines="skip")
+    # ── Timestamp ──────────────────────────────────────────────────────
+    if "date" in df.columns and "time" in df.columns:
+        df["ts_raw"] = pd.to_datetime(
+            df["date"].astype(str) + " " + df["time"].astype(str),
+            errors="coerce"
+        )
+        df["ts_raw"] = df["ts_raw"].dt.tz_localize(
+            TIMEZONE, ambiguous="infer", nonexistent="shift_forward"
+        )
+    else:
+        ts_col = next(
+            (c for c in df.columns if c in ["ts_event","timestamp","datetime","date"]),
+            df.columns[0]
+        )
+        df["ts_raw"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        df["ts_raw"] = df["ts_raw"].dt.tz_convert(TIMEZONE)
+
+    df = df.dropna(subset=["ts_raw"])
+    df = df.set_index("ts_raw").sort_index()
+
+    for c in ["open","high","low","close"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # ── Price filter ───────────────────────────────────────────────────
+    mask = (
+        df["open"].between(PRICE_FLOOR, PRICE_CEIL) &
+        df["high"].between(PRICE_FLOOR, PRICE_CEIL) &
+        df["low"].between(PRICE_FLOOR, PRICE_CEIL)  &
+        df["close"].between(PRICE_FLOOR, PRICE_CEIL) &
+        (df["low"] <= df["high"])
+    )
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        mask &= df["volume"].fillna(0) > 0
+
+    df = df[mask].copy()
+
+    # ── Resample ───────────────────────────────────────────────────────
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "volume" in df.columns:
+        agg["volume"] = "sum"
+    df = df.resample(tf).agg(agg).dropna(subset=["open","close"])
+
+    return df
 
     # ── Filter to front-month symbol if multi-symbol file ─────────────────
     if "symbol" in df.columns:
@@ -509,13 +551,12 @@ def render_results(results: pd.DataFrame):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if run_btn:
-    if not (github_url.startswith("https://raw.githubusercontent.com") or 
-        github_url.startswith("https://drive.google.com")):
-        st.error("Please enter a valid GitHub **raw** URL (starts with https://raw.githubusercontent.com/...)")
+    if uploaded_file is None:
+        st.error("Please upload a CSV file first.")
         st.stop()
 
     try:
-        df = load_data(github_url, timeframe)
+        df = load_data(uploaded_file.getvalue(), timeframe)
     except Exception as e:
         st.error(f"Failed to load data: {e}")
         st.stop()
