@@ -82,12 +82,72 @@ def load_data(url: str, tf: str) -> pd.DataFrame:
     r = requests.get(url, timeout=30)
     r.raise_for_status()
 
-    raw   = StringIO(r.text)
     first = r.text.splitlines()[0]
     sep   = "\t" if "\t" in first else ","
-    df    = pd.read_csv(StringIO(r.text), sep=sep)
 
-    # ... rest of the function unchanged
+    df = pd.read_csv(StringIO(r.text), sep=sep, on_bad_lines="skip")
+
+    # ── Filter to front-month symbol if multi-symbol file ─────────────────
+    if "symbol" in df.columns:
+        # Pick the symbol with the most rows (front month)
+        top_symbol = df["symbol"].value_counts().idxmax()
+        df = df[df["symbol"] == top_symbol].copy()
+
+    # ── Timestamp ──────────────────────────────────────────────────────────
+    if "Date" in df.columns and "Time" in df.columns:
+        df["ts_raw"] = pd.to_datetime(
+            df["Date"].astype(str) + " " + df["Time"].astype(str),
+            errors="coerce"
+        )
+        df["ts_raw"] = df["ts_raw"].dt.tz_localize(
+            TIMEZONE, ambiguous="infer", nonexistent="shift_forward"
+        )
+    else:
+        ts_col = next(
+            (c for c in df.columns if c.lower() in ["ts_event","timestamp","datetime","date"]),
+            df.columns[0]
+        )
+        df["ts_raw"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        df["ts_raw"] = df["ts_raw"].dt.tz_convert(TIMEZONE)
+
+    df = df.dropna(subset=["ts_raw"])
+
+    # ── OHLCV columns ──────────────────────────────────────────────────────
+    col_map = {}
+    for target in ["open","high","low","close","volume"]:
+        for col in df.columns:
+            if col.lower() == target:
+                col_map[target] = col
+                break
+
+    df = df.rename(columns={v: k for k, v in col_map.items()})
+    df = df.set_index("ts_raw").sort_index()
+
+    for c in ["open","high","low","close"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # ── Price filter ───────────────────────────────────────────────────────
+    mask = (
+        df["open"].between(PRICE_FLOOR, PRICE_CEIL) &
+        df["high"].between(PRICE_FLOOR, PRICE_CEIL) &
+        df["low"].between(PRICE_FLOOR, PRICE_CEIL)  &
+        df["close"].between(PRICE_FLOOR, PRICE_CEIL) &
+        (df["low"] <= df["high"])
+    )
+    # Volume filter only if column exists and is non-zero
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        mask &= df["volume"].fillna(0) > 0
+
+    df = df[mask].copy()
+
+    # ── Resample ───────────────────────────────────────────────────────────
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "volume" in df.columns:
+        agg["volume"] = "sum"
+    df = df.resample(tf).agg(agg).dropna(subset=["open","close"])
+
+    return df
 
     # ── Timestamp ─────────────────────────────────────────────────────────────
     # Handle separate Date + Time columns (common in NQ exports)
