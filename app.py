@@ -1,949 +1,1188 @@
-"""
-╔═══════════════════════════════════════════════════════════════════════════╗
-║  FAKE BREAKOUT BACKTEST ENGINE  v3                                        ║
-╠═══════════════════════════════════════════════════════════════════════════╣
-║  CHANGES FROM v2                                                          ║
-║  • Heatmap: static grid, strike % on cells, "09:30–09:35" range labels   ║
-║  • Heatmap click → analytics update fixed via @st.fragment               ║
-║  • Removed P&L entirely — goal is repeatable MAE/MFE setup discovery     ║
-║  • Removed weekday filter from sidebar                                    ║
-║  • Removed ADX/ATR/Z-Score range sliders from sidebar                    ║
-║  • New Regime tab: how each feature bin shifts MAE and MFE               ║
-║  • @st.fragment on heatmap+analytics — only that section rerenders       ║
-╚═══════════════════════════════════════════════════════════════════════════╝
-"""
+# ============================================================
+#  MAE / MFE PIPELINE — Streamlit Application
+#  Run:  streamlit run pipeline.py
+# ============================================================
 
-import io
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+from scipy import stats
+import io, requests, warnings
+from datetime import date, timedelta
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
+warnings.filterwarnings("ignore")
+
+# ── PAGE ─────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Fake Breakout Backtest",
-    page_icon="⚡",
+    page_title="MAE / MFE PIPELINE",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ──────────────────────────────────────────────────────────────────────────────
-TF_MINUTES: dict[str, int] = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
-DAY_ORDER = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-MAX_TRADE_BARS = 600
-
-C = {
-    "bg0":"#070709","bg1":"#0d0d10","bg2":"#131318","bg3":"#1a1a20",
-    "border":"#22222a","border2":"#2e2e38",
-    "t0":"#f2f2f4","t1":"#9898a8","t2":"#55555f","t3":"#35353f",
-    "green":"#00e87a","red":"#ff4455","yellow":"#ffc840","blue":"#3d9eff",
-    "green_dim":"rgba(0,232,122,0.10)","red_dim":"rgba(255,68,85,0.10)",
-}
-
-PLOTLY_BASE = dict(
-    paper_bgcolor=C["bg0"], plot_bgcolor=C["bg1"],
-    font=dict(family="'Geist Mono','JetBrains Mono',monospace", color=C["t1"], size=11),
-    margin=dict(l=55, r=20, t=50, b=50),
-)
-
-AXIS = dict(
-    gridcolor=C["border"], linecolor=C["border"], tickcolor=C["border"],
-    zeroline=False, tickfont=dict(size=10, color=C["t2"]),
-)
-
-
-def _layout(**kw) -> dict:
-    """Merge PLOTLY_BASE with per-call overrides — no duplicate-kwarg TypeError."""
-    return {**PLOTLY_BASE, **kw}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CSS
-# ──────────────────────────────────────────────────────────────────────────────
-def inject_css() -> None:
-    st.markdown(f"""
+# ── CSS ──────────────────────────────────────────────────────
+st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600;700&display=swap');
-*,html,body{{font-family:'Geist Mono','JetBrains Mono',monospace!important;box-sizing:border-box}}
-.stApp,[data-testid="stAppViewContainer"]{{background:{C["bg0"]}!important;color:{C["t0"]}!important}}
-[data-testid="stHeader"]{{background:transparent!important}}
-::-webkit-scrollbar{{width:5px;height:5px}}
-::-webkit-scrollbar-track{{background:{C["bg1"]}}}
-::-webkit-scrollbar-thumb{{background:{C["border2"]};border-radius:3px}}
-[data-testid="stSidebar"]{{background:{C["bg1"]}!important;border-right:1px solid {C["border"]}!important}}
-[data-testid="stSidebar"] *{{color:{C["t0"]}!important}}
-[data-testid="stSidebar"] .stSelectbox>div>div,[data-testid="stSidebar"] .stMultiSelect>div>div{{
-  background:{C["bg2"]}!important;border:1px solid {C["border"]}!important;border-radius:5px!important}}
-[data-testid="stSidebar"] section{{padding-top:0!important}}
-.stTextInput>div>div>input,.stNumberInput>div>div>input{{
-  background:{C["bg2"]}!important;border:1px solid {C["border"]}!important;
-  color:{C["t0"]}!important;border-radius:5px!important;font-family:'Geist Mono',monospace!important}}
-.stTextInput>div>div>input:focus,.stNumberInput>div>div>input:focus{{
-  border-color:{C["green"]}!important;box-shadow:0 0 0 2px rgba(0,232,122,.1)!important;outline:none!important}}
-.stButton>button{{
-  background:{C["bg2"]}!important;border:1px solid {C["border2"]}!important;color:{C["t1"]}!important;
-  border-radius:5px!important;font-family:'Geist Mono',monospace!important;
-  font-size:.78rem!important;letter-spacing:.04em!important;padding:8px 16px!important;transition:all .15s!important}}
-.stButton>button:hover{{border-color:{C["green"]}!important;color:{C["green"]}!important;background:{C["green_dim"]}!important}}
-[data-testid="stSlider"]>div>div>div>div{{background:{C["green"]}!important}}
-[data-testid="stSlider"] [role="slider"]{{background:{C["green"]}!important;border:2px solid {C["bg0"]}!important;box-shadow:0 0 0 1px {C["green"]}!important}}
-[data-testid="stFileUploader"]>div{{background:{C["bg2"]}!important;border:1px dashed {C["border2"]}!important;border-radius:6px!important}}
-[data-testid="stFileUploader"]>div:hover{{border-color:{C["green"]}!important}}
-.stTabs [data-baseweb="tab-list"]{{background:{C["bg1"]}!important;border-bottom:1px solid {C["border"]}!important;gap:0!important;padding:0!important}}
-.stTabs [data-baseweb="tab"]{{background:transparent!important;color:{C["t2"]}!important;border:none!important;
-  border-bottom:2px solid transparent!important;font-size:.73rem!important;letter-spacing:.06em!important;padding:8px 16px!important}}
-.stTabs [aria-selected="true"]{{color:{C["green"]}!important;border-bottom:2px solid {C["green"]}!important;background:{C["green_dim"]}!important}}
-.streamlit-expanderHeader{{background:{C["bg2"]}!important;border:1px solid {C["border"]}!important;
-  border-radius:5px!important;color:{C["t1"]}!important;font-size:.78rem!important}}
-.streamlit-expanderContent{{background:{C["bg1"]}!important;border:1px solid {C["border"]}!important;
-  border-top:none!important;border-radius:0 0 5px 5px!important}}
-.stAlert{{background:{C["bg2"]}!important;border:1px solid {C["border"]}!important;border-radius:5px!important}}
-.stDataFrame{{background:{C["bg1"]}!important;border-radius:6px}}
-.stSpinner>div{{border-top-color:{C["green"]}!important}}
-.stCheckbox label,.stRadio label{{color:{C["t1"]}!important;font-size:.8rem!important}}
-.kpi-card{{background:{C["bg2"]};border:1px solid {C["border"]};border-radius:6px;padding:14px 18px}}
-.kpi-label{{font-size:.60rem;color:{C["t2"]};text-transform:uppercase;letter-spacing:.12em;margin-bottom:5px}}
-.kpi-value{{font-size:1.35rem;font-weight:600;color:{C["t0"]};line-height:1}}
-.kpi-value.green{{color:{C["green"]}}}.kpi-value.red{{color:{C["red"]}}}.kpi-value.yellow{{color:{C["yellow"]}}}
-.section-label{{font-size:.60rem;font-weight:600;color:{C["t3"]};text-transform:uppercase;
-  letter-spacing:.15em;padding-bottom:6px;border-bottom:1px solid {C["border"]};margin:18px 0 10px 0}}
-.badge{{display:inline-block;font-size:.60rem;padding:2px 8px;border-radius:3px;letter-spacing:.08em;text-transform:uppercase;font-weight:500}}
-.badge-green{{background:{C["green_dim"]};color:{C["green"]};border:1px solid rgba(0,232,122,.25)}}
-.badge-red{{background:{C["red_dim"]};color:{C["red"]};border:1px solid rgba(255,68,85,.25)}}
-.badge-dim{{background:{C["bg3"]};color:{C["t2"]};border:1px solid {C["border"]}}}
-.badge-yellow{{background:rgba(255,200,64,.10);color:{C["yellow"]};border:1px solid rgba(255,200,64,.25)}}
-.top-header{{display:flex;align-items:center;gap:14px;padding-bottom:18px;border-bottom:1px solid {C["border"]};margin-bottom:22px}}
-.top-header .pulse{{width:8px;height:8px;background:{C["green"]};border-radius:50%;box-shadow:0 0 8px {C["green"]};flex-shrink:0}}
-.top-header .title{{font-size:1.05rem;font-weight:600;color:{C["t0"]};letter-spacing:.02em}}
-.top-header .sub{{font-size:.65rem;color:{C["t2"]};margin-top:3px;letter-spacing:.06em}}
-.cell-banner{{background:{C["bg2"]};border:1px solid {C["green"]};border-radius:6px;
-  padding:10px 16px;margin-bottom:14px;display:flex;align-items:center;gap:12px;font-size:.78rem}}
-hr{{border-color:{C["border"]}!important}}
-div[data-testid="column"]{{padding:0 4px!important}}
-</style>""", unsafe_allow_html=True)
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+
+*, *::before, *::after {
+  font-family: 'Geist Mono', 'JetBrains Mono', ui-monospace,
+               'Cascadia Code', 'Courier New', monospace !important;
+  box-sizing: border-box;
+}
+html, body, .stApp { background:#000 !important; color:#e0e0e0 !important; }
+.block-container { padding-top:1.2rem !important; max-width:1500px !important; }
+#MainMenu, footer, header { visibility:hidden !important; }
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+  background:#070707 !important;
+  border-right:1px solid #1d1d1d !important;
+}
+section[data-testid="stSidebar"] * { color:#e0e0e0 !important; }
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+  gap:0 !important; background:#000 !important;
+  border-bottom:1px solid #222 !important; overflow-x:auto !important;
+}
+.stTabs [data-baseweb="tab"] {
+  background:#000 !important; color:#3a3a3a !important;
+  border:1px solid #1a1a1a !important; border-bottom:none !important;
+  padding:5px 13px !important; font-size:9.5px !important;
+  letter-spacing:.12em !important; text-transform:uppercase !important;
+  white-space:nowrap !important; margin-right:2px !important;
+}
+.stTabs [aria-selected="true"] {
+  background:#e0e0e0 !important; color:#000 !important;
+  border-color:#e0e0e0 !important;
+}
+.stTabs [data-baseweb="tab-panel"] { background:#000 !important; padding:0 !important; }
+
+/* Buttons */
+.stButton > button {
+  background:#e0e0e0 !important; color:#000 !important; border:none !important;
+  font-size:10px !important; font-weight:700 !important;
+  letter-spacing:.15em !important; text-transform:uppercase !important;
+  padding:7px 18px !important; border-radius:0 !important;
+}
+.stButton > button:hover { background:#bbb !important; }
+
+/* Widgets */
+.stSelectbox label, .stNumberInput label, .stSlider label,
+.stDateInput label, .stTextInput label, .stRadio label,
+.stCheckbox label { font-size:9.5px !important; color:#444 !important;
+  letter-spacing:.1em !important; text-transform:uppercase !important; }
+
+/* Progress */
+.stProgress > div > div { background:#e0e0e0 !important; }
+
+/* Metrics */
+[data-testid="stMetric"] {
+  background:#080808 !important; border:1px solid #1d1d1d !important; padding:12px !important;
+}
+[data-testid="stMetricLabel"] { font-size:9px !important; color:#444 !important; }
+[data-testid="stMetricValue"] { font-size:18px !important; color:#e0e0e0 !important; }
+[data-testid="stMetricDelta"] { font-size:10px !important; }
+
+/* Tables */
+table { font-size:10.5px !important; width:100% !important; border-collapse:collapse !important; }
+th { background:#0a0a0a !important; color:#444 !important;
+     border:1px solid #1d1d1d !important; padding:7px !important;
+     font-size:9px !important; letter-spacing:.1em !important; text-transform:uppercase !important; }
+td { background:#000 !important; color:#e0e0e0 !important;
+     border:1px solid #111 !important; padding:5px 8px !important; }
+
+/* Alerts */
+.stAlert { background:#0a0a0a !important; border:1px solid #1d1d1d !important;
+           color:#888 !important; border-radius:0 !important; font-size:10.5px !important; }
+hr { border-color:#1a1a1a !important; margin:10px 0 !important; }
+
+/* Custom */
+.sec { font-size:9px; color:#3d3d3d; letter-spacing:.2em; text-transform:uppercase;
+       padding-bottom:7px; border-bottom:1px solid #1a1a1a; margin-top:20px; margin-bottom:14px; }
+.kpi { border:1px solid #1d1d1d; background:#060606; padding:14px; }
+.kpi-lbl { font-size:9px; color:#444; letter-spacing:.15em; text-transform:uppercase; margin-bottom:5px; }
+.kpi-val { font-size:20px; color:#e0e0e0; font-weight:700; }
+.kpi-sub { font-size:9px; color:#3d3d3d; margin-top:4px; }
+.step-box { border:1px solid #1a1a1a; padding:11px 14px; margin-bottom:5px; background:#050505; }
+.step-num { font-size:9px; color:#333; letter-spacing:.18em; margin-bottom:3px; }
+.step-ttl { font-size:12.5px; color:#e0e0e0; margin-bottom:3px; }
+.step-dsc { font-size:9.5px; color:#4d4d4d; }
+.pass { display:inline-block; background:#e0e0e0; color:#000; padding:1px 8px;
+        font-size:9px; font-weight:700; letter-spacing:.1em; }
+.fail { display:inline-block; background:#1d1d1d; color:#555; padding:1px 8px;
+        font-size:9px; letter-spacing:.1em; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── MATPLOTLIB STYLE ─────────────────────────────────────────
+plt.rcParams.update({
+    "figure.facecolor":"#000",  "axes.facecolor":"#060606",
+    "axes.edgecolor":"#1d1d1d", "axes.labelcolor":"#555",
+    "text.color":"#e0e0e0",     "xtick.color":"#444",
+    "ytick.color":"#444",       "grid.color":"#111",
+    "grid.linestyle":"-",       "grid.linewidth":.5,
+    "font.family":"monospace",  "font.size":8.5,
+    "axes.titlesize":9.5,       "axes.titlecolor":"#aaa",
+    "legend.facecolor":"#060606","legend.edgecolor":"#1d1d1d",
+    "legend.fontsize":8,        "figure.dpi":110,
+    "savefig.facecolor":"#000", "lines.linewidth":1.2,
+})
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# DATA LOADING
-# ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, max_entries=4)
-def _load_csv(content: bytes) -> pd.DataFrame:
-    return pd.read_csv(io.BytesIO(content))
+# ════════════════════════════════════════════════════════════
+#  DATA LAYER
+# ════════════════════════════════════════════════════════════
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def _load_parquet(path: str) -> pd.DataFrame:
-    return pd.read_parquet(path)
-
-@st.cache_data(show_spinner=False, max_entries=4)
-def preprocess(df_raw: pd.DataFrame, years: int) -> pd.DataFrame:
-    df = df_raw.copy()
-    ts = next((c for c in df.columns if c.lower() in ("timestamp","datetime","time","date")), None)
-    if ts:
-        df[ts] = pd.to_datetime(df[ts], utc=False, errors="coerce")
-        df = df.set_index(ts)
-    elif not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=False, errors="coerce")
-    df.index.name = "timestamp"
-    df = df[~df.index.isna()].sort_index()
-    df.columns = [c.lower().strip() for c in df.columns]
-    miss = [c for c in ["open","high","low","close"] if c not in df.columns]
-    if miss:
-        raise ValueError(f"Missing: {miss}")
-    for col in ["open","high","low","close","volume","adx_14","atr_14","zscore_20"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["open","high","low","close"])
-    if years > 0:
-        df = df.loc[df.index >= df.index[-1] - pd.DateOffset(years=years)]
-    if df.empty:
-        raise ValueError("No data after filtering.")
-    df["_date"]         = df.index.date
-    df["_weekday_name"] = df.index.day_name()
-    df["_bar_idx"]      = np.arange(len(df), dtype=np.int32)
-    return df
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SIGNALS  — breakout ALWAYS detected on 1-min bars
-# ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, max_entries=8)
-def compute_signals(df: pd.DataFrame, tf_minutes: int,
-                    cs: str = "", ce: str = "") -> pd.DataFrame:
-    freq = f"{tf_minutes}min"
-    rc = df.resample(freq).agg(
-        range_high=("high","max"),
-        range_low =("low", "min"),
-        range_vol =("close","std"),      # realized vol of consolidation window
-    ).dropna(subset=["range_high","range_low"])
-    rc.index.name = "range_start"
-    rc = rc.reset_index()
-    rc["range_end"]   = rc["range_start"] + pd.Timedelta(minutes=tf_minutes)
-    rc["range_label"] = (rc["range_start"].dt.strftime("%H:%M") + "–" +
-                         rc["range_end"].dt.strftime("%H:%M"))
-
-    if cs and ce:
+@st.cache_data(show_spinner=False)
+def fetch_api(years: tuple, path: str, tf: str) -> pd.DataFrame:
+    base = "https://data-api.londonstrategicedge.com/download/candles"
+    dfs = []
+    for yr in years:
+        url = f"{base}/{path}/{tf}/{yr}.csv.gz"
         try:
-            t0 = pd.to_datetime(cs, format="%H:%M").time()
-            t1 = pd.to_datetime(ce, format="%H:%M").time()
-            rc = rc[(rc["range_start"].dt.time >= t0) & (rc["range_start"].dt.time < t1)]
+            r = requests.get(url, timeout=60)
+            if r.status_code == 200:
+                dfs.append(pd.read_csv(io.BytesIO(r.content), compression="gzip"))
         except Exception:
             pass
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-    if rc.empty:
-        return pd.DataFrame()
+@st.cache_data(show_spinner=False)
+def parse_upload(raw: bytes, name: str) -> pd.DataFrame:
+    kw = {"compression":"gzip"} if name.endswith(".gz") else {}
+    return pd.read_csv(io.BytesIO(raw), **kw)
 
-    extra = [c for c in ["adx_14","atr_14","zscore_20"] if c in df.columns]
-    bars  = df[["high","low","close","_date","_weekday_name","_bar_idx"] + extra].reset_index()
-    bars  = bars.sort_values("timestamp")
-    rc    = rc.sort_values("range_end")
+def standardise(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    ts = next((c for c in df.columns if "time" in c or "date" in c), df.columns[0])
+    df = df.rename(columns={ts:"ts"})
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df.get(c, np.nan), errors="coerce")
+    return df[["ts","open","high","low","close","volume"]].dropna(subset=["open"])
 
-    merged = pd.merge_asof(
-        bars,
-        rc[["range_start","range_end","range_high","range_low","range_vol","range_label"]],
-        left_on="timestamp", right_on="range_end", direction="backward",
-    ).dropna(subset=["range_start"])
-
-    merged["_rdate"] = merged["range_start"].dt.date
-    merged = merged[(merged["_date"] == merged["_rdate"]) &
-                    (merged["timestamp"] >= merged["range_end"])]
-    if merged.empty:
-        return pd.DataFrame()
-
-    sh = merged[merged["close"] > merged["range_high"]].copy()
-    sh["direction"] = "short"; sh["entry_price"] = sh["close"]
-    lo = merged[merged["close"] < merged["range_low"]].copy()
-    lo["direction"] = "long";  lo["entry_price"] = lo["close"]
-
-    sig = pd.concat([sh, lo], ignore_index=True).sort_values("timestamp")
-    sig = sig.groupby(["range_start","direction"], sort=False).first().reset_index()
-    return sig
+def date_slice(df: pd.DataFrame, s: date, e: date) -> pd.DataFrame:
+    m = (df["ts"].dt.date >= s) & (df["ts"].dt.date <= e)
+    return df[m].reset_index(drop=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# RISK LEVELS
-# ──────────────────────────────────────────────────────────────────────────────
-def _levels(ep, rh, rl, rvol, atr, is_short, risk_mode, sl_k, tp_mode, tp_k):
-    has_atr = ~np.isnan(atr)
-    sl_dist = np.where(has_atr, sl_k*atr, ep*sl_k/100) if risk_mode=="atr" else ep*(sl_k/100)
-    sl = np.where(is_short, ep+sl_dist, ep-sl_dist)
-    if tp_mode == "range":
-        tp = np.where(is_short, rl, rh)
-    elif tp_mode == "vol":
-        has_vol = ~np.isnan(rvol) & (rvol > 0)
-        td = np.where(has_vol, tp_k*rvol, np.where(has_atr, tp_k*atr, ep*tp_k/100))
-        tp = np.where(is_short, ep-td, ep+td)
-    else:
-        tp = np.where(is_short, ep*(1-tp_k/100), ep*(1+tp_k/100))
-    return sl, tp
+# ════════════════════════════════════════════════════════════
+#  PIPELINE COMPUTATIONS
+# ════════════════════════════════════════════════════════════
 
+def compute_box(df: pd.DataFrame, hr: int, mins: int) -> pd.DataFrame:
+    """High/low of first `mins` minutes of hour `hr` UTC per calendar date."""
+    d = df.copy()
+    d["_dt"] = d["ts"].dt.date
+    d["_h"]  = d["ts"].dt.hour
+    d["_m"]  = d["ts"].dt.minute
+    sub = d[(d["_h"] == hr) & (d["_m"] < mins)]
+    g = sub.groupby("_dt").agg(
+        box_high=("high","max"), box_low=("low","min"),
+        box_open=("open","first"),
+    ).reset_index().rename(columns={"_dt":"date"})
+    g["box_range"] = (g["box_high"] - g["box_low"]) * 10_000   # pips
+    return g.reset_index(drop=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SIMULATION  — MAE/MFE only, no P&L
-# ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, max_entries=8)
-def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame,
-                    risk_mode: str, sl_k: float,
-                    tp_mode: str,   tp_k: float = 1.0,
-                    max_bars: int = MAX_TRADE_BARS) -> pd.DataFrame:
-    if signals.empty:
-        return pd.DataFrame()
-
-    highs  = df["high"].values.astype(np.float64)
-    lows   = df["low"].values.astype(np.float64)
-    closes = df["close"].values.astype(np.float64)
-    N      = len(highs)
-
-    ep      = signals["entry_price"].values.astype(np.float64)
-    rh      = signals["range_high"].values.astype(np.float64)
-    rl      = signals["range_low"].values.astype(np.float64)
-    rvol    = signals["range_vol"].values.astype(np.float64) if "range_vol" in signals.columns \
-              else np.full(len(signals), np.nan)
-    atr_col = signals["atr_14"].values.astype(np.float64) if "atr_14" in signals.columns \
-              else np.full(len(signals), np.nan)
-    is_sh   = signals["direction"].values == "short"
-    eb      = signals["_bar_idx"].values.astype(np.int32)
-
-    sl_arr, tp_arr = _levels(ep, rh, rl, rvol, atr_col, is_sh, risk_mode, sl_k, tp_mode, tp_k)
-
-    n        = len(signals)
-    outcomes = np.full(n, "timeout", dtype=object)
-    exit_px  = ep.copy()
-    mae_pts  = np.zeros(n, np.float64)
-    mfe_pts  = np.zeros(n, np.float64)
-    dur_bars = np.zeros(n, np.int32)
-
-    for i in range(n):
-        s = int(eb[i]) + 1
-        e_ = min(s + max_bars, N)
-        if s >= N:
-            continue
-        fh, fl, fc = highs[s:e_], lows[s:e_], closes[s:e_]
-        if not len(fh):
-            continue
-        shrt = bool(is_sh[i])
-        sl, tp = sl_arr[i], tp_arr[i]
-
-        sl_hit = fh >= sl if shrt else fl <= sl
-        tp_hit = fl <= tp if shrt else fh >= tp
-        f_sl   = int(np.argmax(sl_hit)) if sl_hit.any() else len(fh)
-        f_tp   = int(np.argmax(tp_hit)) if tp_hit.any() else len(fh)
-
-        if not sl_hit.any() and not tp_hit.any():
-            xl, outcomes[i], exit_px[i] = len(fh)-1, "timeout", fc[-1]
-        elif f_sl <= f_tp:
-            xl, outcomes[i], exit_px[i] = f_sl, "sl_hit", sl
-        else:
-            xl, outcomes[i], exit_px[i] = f_tp, "tp_hit", tp
-
-        dur_bars[i] = xl + 1
-        th, tl = fh[:xl+1], fl[:xl+1]
-        if shrt:
-            mfe_pts[i] = max(0.0, ep[i] - float(np.min(tl)))
-            mae_pts[i] = max(0.0, float(np.max(th)) - ep[i])
-        else:
-            mfe_pts[i] = max(0.0, float(np.max(th)) - ep[i])
-            mae_pts[i] = max(0.0, ep[i] - float(np.min(tl)))
-
-    res = signals.copy()
-    res["sl_price"]   = sl_arr
-    res["tp_price"]   = tp_arr
-    res["outcome"]    = outcomes
-    res["exit_price"] = exit_px
-    res["mae"]        = mae_pts
-    res["mfe"]        = mfe_pts
-    res["duration"]   = dur_bars
-    res["tp_hit"]     = outcomes == "tp_hit"
-    res["mae_pct"]    = mae_pts / ep * 100
-    res["mfe_pct"]    = mfe_pts / ep * 100
-    return res
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# AGGREGATION
-# ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, max_entries=16)
-def aggregate_heatmap(trades: pd.DataFrame) -> pd.DataFrame:
-    if trades.empty:
-        return pd.DataFrame()
-    agg = (trades.groupby(["_weekday_name","range_label"])
-           .agg(n=("tp_hit","count"), n_tp=("tp_hit","sum"),
-                avg_mae=("mae_pct","mean"), avg_mfe=("mfe_pct","mean"))
-           .reset_index())
-    agg["strike_rate"] = (agg["n_tp"] / agg["n"] * 100).round(1)
-    return agg
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HEATMAP FIGURE
-# ──────────────────────────────────────────────────────────────────────────────
-def fig_heatmap(agg: pd.DataFrame) -> go.Figure:
-    days  = [d for d in DAY_ORDER if d in agg["_weekday_name"].values]
-    pivot = (agg.pivot(index="range_label", columns="_weekday_name", values="strike_rate")
-               .reindex(columns=days).sort_index())
-    p_mae = (agg.pivot(index="range_label", columns="_weekday_name", values="avg_mae")
-               .reindex(columns=days).reindex(pivot.index))
-    p_mfe = (agg.pivot(index="range_label", columns="_weekday_name", values="avg_mfe")
-               .reindex(columns=days).reindex(pivot.index))
-    p_n   = (agg.pivot(index="range_label", columns="_weekday_name", values="n")
-               .reindex(columns=days).reindex(pivot.index))
-
-    z      = pivot.values
-    labels = pivot.index.tolist()
-    nrows  = len(labels)
-
-    # Strike rate text on each cell
-    cell_text = [[f"{v:.0f}%" if not np.isnan(v) else "" for v in row] for row in z]
-
-    # Rich hover
-    hover = []
-    for ri, lbl in enumerate(labels):
-        row = []
-        for di, d in enumerate(days):
-            sr  = z[ri, di]
-            if np.isnan(sr):
-                row.append(f"<b>{d[:3]} · {lbl}</b><br>No data")
-            else:
-                clr = C["green"] if sr >= 50 else C["red"]
-                ic  = "▲" if sr >= 50 else "▼"
-                row.append(
-                    f"<b>{d[:3]} · {lbl}</b><br>"
-                    f"<span style='color:{clr}'>{ic} {sr:.1f}% TP hit</span><br>"
-                    f"Trades: {int(p_n.values[ri,di])}<br>"
-                    f"<span style='color:{C['red']}'>Avg MAE {p_mae.values[ri,di]:.3f}%</span><br>"
-                    f"<span style='color:{C['green']}'>Avg MFE {p_mfe.values[ri,di]:.3f}%</span>"
-                )
-        hover.append(row)
-
-    colorscale = [
-        [0.00,"#2a0808"],[0.30,"#5a1010"],[0.45,"#8a2800"],
-        [0.50,"#1a1a20"],[0.55,"#0a2a18"],[0.70,"#006030"],
-        [1.00, C["green"]],
-    ]
-    cell_h   = max(18, min(32, 600 // max(nrows, 1)))
-    fig_h    = min(900, cell_h * nrows + 130)
-    txt_size = max(7, min(10, cell_h - 8))
-
-    fig = go.Figure(go.Heatmap(
-        z=z, x=days, y=labels,
-        text=cell_text, customdata=hover,
-        texttemplate="%{text}",
-        textfont=dict(size=txt_size, color="rgba(242,242,244,0.88)"),
-        hovertemplate="%{customdata}<extra></extra>",
-        colorscale=colorscale,
-        zmid=50, zmin=0, zmax=100,
-        xgap=2, ygap=1,
-        colorbar=dict(
-            title=dict(text="TP hit %", font=dict(color=C["t2"], size=10)),
-            tickfont=dict(color=C["t2"], size=9),
-            bgcolor=C["bg0"], bordercolor=C["border"],
-            thickness=10, len=0.8,
-            tickvals=[0,25,50,75,100],
-            ticktext=["0%","25%","50%","75%","100%"],
-        ),
-    ))
-    fig.update_layout(**_layout(
-        height=fig_h,
-        dragmode=False,                  # no pan/drag
-        title=dict(text="TP Hit Rate — click a cell to see MAE/MFE breakdown",
-                   font=dict(size=11, color=C["t1"]), x=0.01),
-        xaxis=dict(side="top", fixedrange=True,
-                   tickfont=dict(size=11, color=C["t1"]),
-                   **{k:v for k,v in AXIS.items() if k!="tickfont"}),
-        yaxis=dict(autorange="reversed", fixedrange=True,
-                   tickfont=dict(size=9, color=C["t0"]),
-                   **{k:v for k,v in AXIS.items() if k!="tickfont"}),
-        margin=dict(l=90, r=20, t=60, b=20),
-    ))
-    return fig
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ANALYTICS FIGURES
-# ──────────────────────────────────────────────────────────────────────────────
-
-def fig_mae_mfe(trades: pd.DataFrame, label: str = "") -> go.Figure:
-    fig = make_subplots(1, 2,
-        subplot_titles=["MAE  (adverse excursion)", "MFE  (favorable excursion)"],
-        horizontal_spacing=0.08)
-    mv, fv = trades["mae_pct"].dropna(), trades["mfe_pct"].dropna()
-    fig.add_trace(go.Histogram(x=mv, name="MAE", marker_color=C["red"],
-        opacity=0.75, nbinsx=50,
-        hovertemplate="MAE %{x:.3f}%<br>Count %{y}<extra></extra>"), row=1, col=1)
-    fig.add_trace(go.Histogram(x=fv, name="MFE", marker_color=C["green"],
-        opacity=0.75, nbinsx=50,
-        hovertemplate="MFE %{x:.3f}%<br>Count %{y}<extra></extra>"), row=1, col=2)
-    for p, a in [(25,"p25"),(50,"p50"),(75,"p75")]:
-        if len(mv):
-            fig.add_vline(x=float(np.percentile(mv,p)), row=1, col=1,
-                line=dict(color=C["red"],dash="dash",width=1),
-                annotation=dict(text=a, font=dict(color=C["red"],size=8), showarrow=False))
-        if len(fv):
-            fig.add_vline(x=float(np.percentile(fv,p)), row=1, col=2,
-                line=dict(color=C["green"],dash="dash",width=1),
-                annotation=dict(text=a, font=dict(color=C["green"],size=8), showarrow=False))
-    ax = dict(gridcolor=C["border"],linecolor=C["border"],tickfont=dict(size=9,color=C["t2"]),zeroline=False)
-    fig.update_layout(**_layout(
-        title=dict(text=f"MAE / MFE Distributions{('  ·  '+label) if label else ''}",
-                   font=dict(size=11,color=C["t1"]),x=0.01),
-        height=295, showlegend=False,
-        xaxis=ax, yaxis=ax, xaxis2=ax, yaxis2=ax,
-        margin=dict(l=50,r=20,t=50,b=30),
-    ))
-    fig.update_annotations(font_size=9)
-    return fig
-
-
-def fig_scatter(trades: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    for oc, clr, op, lbl in [
-        ("tp_hit", C["green"], .55, "TP hit"),
-        ("sl_hit", C["red"],   .55, "SL hit"),
-        ("timeout",C["yellow"],.35, "Timeout"),
-    ]:
-        sub = trades[trades["outcome"] == oc]
-        if sub.empty: continue
-        fig.add_trace(go.Scatter(
-            x=sub["mae_pct"], y=sub["mfe_pct"], mode="markers", name=lbl,
-            marker=dict(color=clr, size=3.5, opacity=op, line=dict(width=0)),
-            hovertemplate=f"<b>{lbl}</b><br>MAE %{{x:.3f}}%<br>MFE %{{y:.3f}}%<extra></extra>",
-        ))
-    fig.update_layout(**_layout(
-        title=dict(text="MAE vs MFE — each dot is one trade",
-                   font=dict(size=11,color=C["t1"]),x=0.01),
-        height=310,
-        xaxis=dict(title="MAE %",**AXIS), yaxis=dict(title="MFE %",**AXIS),
-        legend=dict(font=dict(size=9,color=C["t2"]),bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=55,r=20,t=50,b=40),
-    ))
-    return fig
-
-
-def fig_regime(trades: pd.DataFrame, feature: str) -> go.Figure:
+def compute_measurements(df: pd.DataFrame, box: pd.DataFrame,
+                          hr: int, mins: int, direction: str,
+                          holds: list) -> pd.DataFrame:
     """
-    Bins trades by feature value (12 equal-width bins) and shows:
-    - Top panel : avg MAE (red) and avg MFE (green) bars per bin
-    - Bottom panel: MFE/MAE ratio line — tells you which regime is structurally cleanest
+    For each day and hold period, measure MAE and MFE (pips)
+    from box_high (short) and/or box_low (long).
     """
-    sub = trades.dropna(subset=[feature]).copy()
-    if len(sub) < 10:
-        return go.Figure()
-    sub["_bin"] = pd.cut(sub[feature], bins=12)
-    agg = (sub.groupby("_bin", observed=True)
-             .agg(n=("tp_hit","count"), mae=("mae_pct","mean"), mfe=("mfe_pct","mean"))
-             .reset_index())
-    agg = agg[agg["n"] >= 3]
-    agg["mid"]   = agg["_bin"].apply(lambda x: float(x.mid))
-    agg["ratio"] = (agg["mfe"] / agg["mae"].replace(0, np.nan)).fillna(0)
+    idx = df.set_index("ts").sort_index()
+    pip = 0.0001
+    rows = []
 
-    fig = make_subplots(2, 1, shared_xaxes=True, vertical_spacing=0.08,
-        subplot_titles=[f"Avg MAE & MFE  by  {feature}", "MFE / MAE ratio  (>1 = favorable)"],
-        row_heights=[0.65, 0.35])
+    for _, row in box.iterrows():
+        d = row["date"]
+        bh, bl = row["box_high"], row["box_low"]
+        box_end = pd.Timestamp(str(d), tz="UTC") + pd.Timedelta(hours=hr, minutes=mins)
 
-    fig.add_trace(go.Bar(x=agg["mid"], y=agg["mae"], name="Avg MAE",
-        marker_color=C["red"], opacity=0.8,
-        customdata=agg["n"],
-        hovertemplate=f"{feature}=%{{x:.2f}}<br>MAE %{{y:.3f}}%<br>n=%{{customdata}}<extra></extra>"),
-        row=1, col=1)
-    fig.add_trace(go.Bar(x=agg["mid"], y=agg["mfe"], name="Avg MFE",
-        marker_color=C["green"], opacity=0.8,
-        customdata=agg["n"],
-        hovertemplate=f"{feature}=%{{x:.2f}}<br>MFE %{{y:.3f}}%<br>n=%{{customdata}}<extra></extra>"),
-        row=1, col=1)
-    fig.add_trace(go.Scatter(x=agg["mid"], y=agg["ratio"],
-        mode="lines+markers", name="MFE/MAE",
-        line=dict(color=C["blue"],width=2), marker=dict(size=5,color=C["blue"]),
-        hovertemplate=f"{feature}=%{{x:.2f}}<br>ratio %{{y:.2f}}<extra></extra>"),
-        row=2, col=1)
-    fig.add_hline(y=1.0, row=2, col=1, line=dict(color=C["t3"],dash="dot",width=1))
+        # daily range for regime labelling
+        day_mask = idx.index.date == d
+        dr = (idx.loc[day_mask,"high"].max() - idx.loc[day_mask,"low"].min()) * 10_000 \
+             if day_mask.any() else np.nan
 
-    ax = dict(gridcolor=C["border"],linecolor=C["border"],tickfont=dict(size=9,color=C["t2"]),zeroline=False)
-    fig.update_layout(**_layout(
-        height=370, barmode="group",
-        title=dict(text=f"Regime Impact — {feature}",font=dict(size=11,color=C["t1"]),x=0.01),
-        legend=dict(font=dict(size=9,color=C["t2"]),bgcolor="rgba(0,0,0,0)"),
-        xaxis=ax, yaxis=dict(title="%",**ax),
-        xaxis2=dict(title=feature,**ax), yaxis2=dict(title="ratio",**ax),
-        margin=dict(l=55,r=20,t=50,b=40),
-    ))
-    fig.update_annotations(font_size=9)
-    return fig
+        for hold in holds:
+            hold_end = box_end + pd.Timedelta(hours=hold)
+            try:
+                w = idx.loc[box_end:hold_end]
+            except Exception:
+                continue
+            if len(w) < 2:
+                continue
+            wh, wl = w["high"].max(), w["low"].min()
 
+            dirs = ["short","long"] if direction == "both" else [direction]
+            for dr_dir in dirs:
+                if dr_dir == "short":
+                    mae = max(wh - bh, 0) / pip
+                    mfe = max(bh - wl, 0) / pip
+                else:
+                    mae = max(bl - wl, 0) / pip
+                    mfe = max(wh - bl, 0) / pip
+                rows.append({"date":d,"direction":dr_dir,"hold":hold,
+                              "mae":mae,"mfe":mfe,
+                              "box_range":row["box_range"],"daily_range":dr})
+    return pd.DataFrame(rows)
 
-def _pct_table(trades: pd.DataFrame) -> str:
-    mv, fv = trades["mae_pct"].dropna(), trades["mfe_pct"].dropna()
-    rows = ""
-    for p in [10,25,50,75,90,95]:
-        rows += (f"<tr>"
-                 f"<td style='color:{C['t2']};padding:5px 14px'>p{p}</td>"
-                 f"<td style='color:{C['red']};padding:5px 14px;text-align:right'>"
-                 f"{np.percentile(mv,p):.4f}%" if len(mv) else "—"
-                 f"</td>"
-                 f"<td style='color:{C['green']};padding:5px 14px;text-align:right'>"
-                 f"{np.percentile(fv,p):.4f}%" if len(fv) else "—"
-                 f"</td></tr>")
-    # rebuild correctly
-    rows = ""
-    for p in [10,25,50,75,90,95]:
-        mv_ = f"{np.percentile(mv,p):.4f}%" if len(mv) else "—"
-        fv_ = f"{np.percentile(fv,p):.4f}%" if len(fv) else "—"
-        rows += (f"<tr>"
-                 f"<td style='color:{C['t2']};padding:5px 14px'>p{p}</td>"
-                 f"<td style='color:{C['red']};padding:5px 14px;text-align:right'>{mv_}</td>"
-                 f"<td style='color:{C['green']};padding:5px 14px;text-align:right'>{fv_}</td>"
-                 f"</tr>")
-    return (f"<table style='width:100%;background:{C['bg2']};border:1px solid {C['border']};"
-            f"border-radius:6px;border-collapse:collapse;font-family:Geist Mono,monospace;font-size:.78rem'>"
-            f"<thead><tr style='border-bottom:1px solid {C['border']}'>"
-            f"<th style='color:{C['t3']};padding:7px 14px;text-align:left;letter-spacing:.10em'>PCTILE</th>"
-            f"<th style='color:{C['red']};padding:7px 14px;text-align:right'>MAE %</th>"
-            f"<th style='color:{C['green']};padding:7px 14px;text-align:right'>MFE %</th>"
-            f"</tr></thead><tbody>{rows}</tbody></table>")
+def add_regime(meas: pd.DataFrame, thresh: float = 1.5) -> pd.DataFrame:
+    meas = meas.copy()
+    dr = (meas[["date","daily_range"]].drop_duplicates("date")
+          .set_index("date")["daily_range"].sort_index())
+    roll = dr.rolling(10, min_periods=3).median()
+    ratio = dr / roll
+    meas["range_ratio"] = meas["date"].map(ratio)
+    meas["regime"] = meas["range_ratio"].apply(
+        lambda x: "volatile" if pd.notna(x) and x >= thresh else "calm")
+    return meas
 
+def pct_table(s: pd.Series, ps=(10,25,50,75,90,95)) -> dict:
+    s = s.dropna()
+    return {f"P{p}": float(np.percentile(s, p)) for p in ps} if len(s) > 0 else {}
 
-def kpi(label: str, value: str, variant: str = "") -> str:
-    return (f"<div class='kpi-card'>"
-            f"<div class='kpi-label'>{label}</div>"
-            f"<div class='kpi-value {variant}'>{value}</div>"
-            f"</div>")
+def compute_rho(meas: pd.DataFrame, direction: str, dates: list) -> dict:
+    m = meas[(meas["direction"] == direction) & (meas["date"].isin(dates))]
+    holds = sorted(m["hold"].unique())
+    mae_m = [m[m["hold"]==h]["mae"].median() for h in holds]
+    mfe_m = [m[m["hold"]==h]["mfe"].median() for h in holds]
+    if len(mae_m) < 2 or mae_m[0] == 0 or mfe_m[0] == 0:
+        return {}
+    mg = mae_m[-1] / mae_m[0]
+    fg = mfe_m[-1] / mfe_m[0] if mfe_m[0] > 0 else 1
+    rho = mg / fg if fg > 0 else 1
+    return {"rho":rho,"mae_growth":mg,"mfe_growth":fg,
+            "mae_medians":mae_m,"mfe_medians":mfe_m,"holds":holds,
+            "edge":"WIN-RATE" if rho > 1 else "MOMENTUM"}
 
+def simulate(meas: pd.DataFrame, stop: float, target: float, queen: float,
+             spread: float) -> pd.DataFrame:
+    """Convert MAE/MFE measurements into simulated trade P&L."""
+    rows = []
+    for _, r in meas.iterrows():
+        mae, mfe = r["mae"], r["mfe"]
+        stopped = mae >= stop
+        hit_tgt = mfe >= target
+        hit_q   = mfe >= queen
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ANALYTICS PANEL
-# ──────────────────────────────────────────────────────────────────────────────
-def render_analytics(trades: pd.DataFrame, label: str = "") -> None:
-    if trades.empty:
-        st.warning("No trades for this selection.")
-        return
-
-    n      = len(trades)
-    n_tp   = int(trades["tp_hit"].sum())
-    n_sl   = int((trades["outcome"] == "sl_hit").sum())
-    n_to   = int((trades["outcome"] == "timeout").sum())
-    tp_r   = n_tp / n * 100 if n else 0
-    avg_mae = float(trades["mae_pct"].mean())
-    avg_mfe = float(trades["mfe_pct"].mean())
-    ratio   = avg_mfe / avg_mae if avg_mae > 0 else 0.0
-
-    cs = st.columns(7)
-    for col, lbl, val, var in [
-        (cs[0], "Trades",   f"{n:,}",          ""),
-        (cs[1], "TP Hit",   f"{tp_r:.1f}%",    "green" if tp_r>=50 else "red"),
-        (cs[2], "TP / SL",  f"{n_tp} / {n_sl}",""),
-        (cs[3], "Timeout",  f"{n_to:,}",       "yellow"),
-        (cs[4], "Avg MAE",  f"{avg_mae:.3f}%", "red"),
-        (cs[5], "Avg MFE",  f"{avg_mfe:.3f}%", "green"),
-        (cs[6], "MFE/MAE",  f"{ratio:.2f}",    "green" if ratio>=1 else "red"),
-    ]:
-        col.markdown(kpi(lbl, val, var), unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    _k = label.replace(" ","_").replace("·","").replace(":","").replace("–","_")
-    feat_cols = [c for c in ["adx_14","atr_14","zscore_20"] if c in trades.columns]
-
-    t1, t2, t3, t4 = st.tabs(["📊  MAE / MFE","🔵  Scatter","🔬  Regime Impact","🗂  Trades"])
-
-    with t1:
-        ca, cb = st.columns([3, 2])
-        with ca:
-            st.plotly_chart(fig_mae_mfe(trades, label), use_container_width=True, key=f"mf_{_k}")
-        with cb:
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown(_pct_table(trades), unsafe_allow_html=True)
-            st.markdown("<br>", unsafe_allow_html=True)
-            if ratio >= 1.5:
-                msg = f"MFE/MAE {ratio:.2f} — price moves further toward target than against on average"
-                st.markdown(f'<span class="badge badge-green">{msg}</span>', unsafe_allow_html=True)
-            elif ratio < 1.0:
-                msg = f"MFE/MAE {ratio:.2f} — adverse moves outpace favorable on average"
-                st.markdown(f'<span class="badge badge-red">{msg}</span>', unsafe_allow_html=True)
-
-    with t2:
-        st.plotly_chart(fig_scatter(trades), use_container_width=True, key=f"sc_{_k}")
-
-    with t3:
-        if feat_cols:
-            sel = st.selectbox("Feature", feat_cols, key=f"feat_{_k}",
-                               help="Shows how avg MAE/MFE and their ratio shift across regime bins")
-            sub = trades.dropna(subset=[sel])
-            if len(sub) < 10:
-                st.info(f"Not enough trades with {sel} data to bin.")
-            else:
-                st.plotly_chart(fig_regime(sub, sel), use_container_width=True, key=f"rg_{_k}")
-                st.markdown(
-                    f'<div style="font-size:.70rem;color:{C["t2"]};margin-top:-6px">'
-                    f'Bins with &lt;3 trades hidden. '
-                    f'Blue line above dashed = regime where setup is structurally cleaner (MFE outpaces MAE).</div>',
-                    unsafe_allow_html=True)
+        if stopped and hit_tgt:
+            # Conservative: stop first if MAE ratio > MFE ratio
+            pnl    = -stop if (mae/stop) > (mfe/target) else target
+            outcome = "loss" if pnl < 0 else "win"
+        elif stopped:
+            pnl, outcome = -stop, "loss"
+        elif hit_tgt:
+            pnl, outcome = target, "win"
         else:
-            st.info("No feature columns found (adx_14, atr_14, zscore_20). "
-                    "Add them to your dataset to unlock regime analysis.")
+            # Held to close: use remaining MFE minus proportional adverse
+            pnl = mfe * 0.35 - mae * 0.65
+            outcome = "scratch"
 
-    with t4:
-        show = [c for c in [
-            "range_label","_weekday_name","direction",
-            "entry_price","sl_price","tp_price","exit_price",
-            "outcome","mae_pct","mfe_pct","duration",
-        ] if c in trades.columns]
-        st.dataframe(
-            trades[show].rename(columns={"_weekday_name":"weekday","range_label":"range"})
-                        .round(5).head(2000),
-            use_container_width=True, height=300)
+        pnl -= spread   # cost per trade (spread)
+        rows.append({"date":r["date"],"direction":r["direction"],
+                     "hold":r["hold"],"regime":r.get("regime","all"),
+                     "mae":mae,"mfe":mfe,"pnl":pnl,"outcome":outcome})
+    return pd.DataFrame(rows)
+
+def grade(trades: pd.DataFrame) -> dict:
+    n = len(trades)
+    if n == 0:
+        return {}
+    wins   = trades[trades["outcome"] == "win"]
+    losses = trades[trades["outcome"] == "loss"]
+    wr     = len(wins) / n
+    lr     = len(losses) / n
+    aw     = float(wins["pnl"].mean())   if len(wins)   > 0 else 0
+    al     = float(losses["pnl"].mean()) if len(losses) > 0 else 0
+
+    ev = wr * aw + lr * al
+    tw = wins["pnl"].sum()   if len(wins)   > 0 else 0
+    tl = losses["pnl"].sum() if len(losses) > 0 else 0
+    pf = tw / abs(tl) if tl != 0 else (np.inf if tw > 0 else 0)
+
+    streak = int(np.log(n) / np.log(1/lr)) if 0 < lr < 1 else n
+    dd     = streak * abs(al)
+
+    pnls   = trades["pnl"]
+    sharpe = float(pnls.mean() / pnls.std() * np.sqrt(252)) if pnls.std() > 0 else 0
+    sqn    = float(pnls.mean() / pnls.std() * np.sqrt(n))   if pnls.std() > 0 else 0
+    ror    = float((lr / wr) ** (abs(al) / max(aw, 0.01)))  if wr > 0 and lr > 0 and aw > 0 else 1.0
+    ror    = min(max(ror, 0), 1)
+    kelly  = max(0, min(ev / aw if aw > 0 else 0, 1))
+
+    return {"n":n,"win_rate":wr,"loss_rate":lr,
+            "avg_win":aw,"avg_loss":abs(al),
+            "ev":ev,"profit_factor":pf,
+            "max_streak":streak,"max_dd":dd,
+            "sharpe":sharpe,"sqn":sqn,
+            "risk_of_ruin":ror,"kelly":kelly}
+
+def run_gates(meas: pd.DataFrame, trades: pd.DataFrame, g: dict,
+              n_combos: int, stop: float, target: float, queen: float,
+              spread: float) -> dict:
+    gates = {}
+
+    # G0 — Correctness
+    g0 = g.get("n",0) >= 100 and g.get("profit_factor",0) > 1.0
+    gates["G0"] = {"pass":g0,"critical":True,
+                   "label":"GATE 0  —  CORRECTNESS",
+                   "detail":f"N={g.get('n',0)} (need 100+)  |  PF={g.get('profit_factor',0):.2f} (need >1.0)"}
+
+    # G2 — Perturbation (5-pip shift on stop and target)
+    pv = []
+    for ds, dt in [(-5,0),(5,0),(0,-5),(0,5)]:
+        t2 = simulate(meas, max(stop+ds, 1), max(target+dt, 1), queen, spread)
+        pv.append(grade(t2).get("profit_factor",0) > 1.0)
+    gates["G2"] = {"pass":sum(pv) >= 3,"critical":False,
+                   "label":"GATE 2  —  PERTURBATION",
+                   "detail":f"{sum(pv)}/4 perturbed variants profitable"}
+
+    # G4 — Deflated Sharpe
+    sh = g.get("sharpe",0)
+    n  = max(g.get("n",1), 1)
+    penalty = np.sqrt(2 * np.log(max(n_combos,1))) / np.sqrt(n)
+    dsh = sh - penalty
+    gates["G4"] = {"pass":dsh > 0 and sh > 0.3,"critical":True,
+                   "label":"GATE 4  —  STATISTICAL SIGNIFICANCE",
+                   "detail":f"Raw Sharpe={sh:.3f}  |  Deflated Sharpe={dsh:.3f}  |  n_combos={n_combos}"}
+
+    # G5 — Cost survival
+    gates["G5"] = {"pass":g.get("ev",0) > spread * 1.2,"critical":True,
+                   "label":"GATE 5  —  COST SURVIVAL",
+                   "detail":f"EV={g.get('ev',0):.2f} pips vs spread={spread:.1f} pips"}
+
+    # G7 — Regime-aware walk-forward
+    N  = len(trades)
+    sp = int(N * 0.7)
+    tr = trades.iloc[:sp-5]
+    te = trades.iloc[sp+5:]
+    sub = []
+    for rg in ["calm","volatile"]:
+        tr_r = tr[tr["regime"] == rg]
+        te_r = te[te["regime"] == rg]
+        if len(tr_r) >= 20 and len(te_r) >= 10:
+            sub.append(grade(te_r).get("profit_factor",0) > 1.0)
+    if len(te) >= 20:
+        sub.append(grade(te).get("profit_factor",0) > 1.0)
+    g7 = (sum(sub) >= max(1, round(len(sub)*0.6))) if sub else False
+    gates["G7"] = {"pass":g7,"critical":False,
+                   "label":"GATE 7  —  REGIME WALK-FORWARD",
+                   "detail":f"{sum(sub)}/{len(sub)} walk-forward sub-tests passed"}
+
+    # G8 — Monte Carlo block bootstrap
+    pnls = trades["pnl"].values
+    bs = max(5, int(np.sqrt(len(pnls))))
+    mc_w = 0
+    for _ in range(2000):
+        blocks, idx = [], 0
+        while idx < len(pnls):
+            s = np.random.randint(0, max(1, len(pnls)-bs))
+            blocks.extend(pnls[s:s+bs].tolist()); idx += bs
+        if np.sum(blocks[:len(pnls)]) > 0:
+            mc_w += 1
+    mc = mc_w / 2000
+    gates["G8"] = {"pass":mc >= 0.60,"critical":False,
+                   "label":"GATE 8  —  MONTE CARLO",
+                   "detail":f"{mc:.1%} of 2,000 shuffled sequences profitable (need 60%+)"}
+
+    return gates
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HEATMAP + ANALYTICS FRAGMENT
-# Only this section rerenders when a cell is clicked — main page stays still.
-# ──────────────────────────────────────────────────────────────────────────────
-@st.fragment
-def heatmap_section(ft: pd.DataFrame, p: dict) -> None:
+# ════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("#### PIPELINE CONFIG")
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    if p["custom_range"]:
-        st.markdown(
-            f'<div class="section-label">Custom Range Analytics '
-            f'<span class="badge badge-green" style="margin-left:8px">'
-            f'{p["c_start"]} – {p["c_end"]}</span></div>',
-            unsafe_allow_html=True)
-        render_analytics(ft, f"{p['c_start']}–{p['c_end']}")
-        return
+    st.markdown('<div class="sec">Data Source</div>', unsafe_allow_html=True)
+    source = st.radio("", ["API — London Strategic Edge","Upload CSV / GZ"],
+                      label_visibility="collapsed")
 
-    # badges
-    n_ft   = len(ft)
-    tp_r   = ft["tp_hit"].mean()*100 if n_ft else 0
-    sr_cls = "badge-green" if tp_r >= 50 else "badge-red"
-    rm_cls = "badge-yellow" if p["risk_mode"]=="atr" else "badge-dim"
-    rm_lbl = "ATR Risk" if p["risk_mode"]=="atr" else "Fixed % Risk"
-    st.markdown(
-        f'<span class="badge badge-dim" style="margin-right:8px">{n_ft:,} trades</span>'
-        f'<span class="badge {sr_cls}" style="margin-right:8px">{tp_r:.1f}% TP hit</span>'
-        f'<span class="badge {rm_cls}">{rm_lbl}</span>',
-        unsafe_allow_html=True)
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    st.markdown('<div class="section-label">TP Hit Rate Heatmap</div>', unsafe_allow_html=True)
-
-    agg = aggregate_heatmap(ft)
-    if agg.empty:
-        st.warning("No data — check direction filter."); return
-
-    event = st.plotly_chart(
-        fig_heatmap(agg),
-        use_container_width=True,
-        on_select="rerun",        # fragment reruns on click, not full page
-        key="main_heatmap",
-        config={"displayModeBar": False, "scrollZoom": False},
-    )
-
-    # ── Robust click extraction ───────────────────────────────────────
-    sel_day = sel_range = None
-    try:
-        pts = event.selection.points  # type: ignore[union-attr]
-        if pts:
-            sel_day   = pts[0].get("x")
-            sel_range = pts[0].get("y")
-    except Exception:
-        pass
-
-    if sel_day and sel_range:
-        st.session_state["selected_cell"] = (sel_day, sel_range)
-
-    cell = st.session_state.get("selected_cell")
-
-    # clear button
-    if cell:
-        c1, c2 = st.columns([9, 1])
-        with c1:
-            d, rl = cell
-            st.markdown(
-                f'<div class="cell-banner">'
-                f'<span class="badge badge-green">{d}</span>'
-                f'<span style="color:{C["t0"]};font-weight:600">{rl}</span>'
-                f'<span style="color:{C["t2"]}"> — click another cell to switch</span>'
-                f'</div>', unsafe_allow_html=True)
-        with c2:
-            if st.button("✕", key="clr"):
-                st.session_state["selected_cell"] = None
-                st.rerun(scope="fragment")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Render analytics ──────────────────────────────────────────────
-    if cell:
-        d, rl = cell
-        cell_trades = ft[(ft["_weekday_name"] == d) & (ft["range_label"] == rl)]
-        st.markdown(
-            f'<div class="section-label">Analytics — {d} · {rl}</div>',
-            unsafe_allow_html=True)
-        render_analytics(cell_trades, f"{d} · {rl}")
+    if "API" in source:
+        st.markdown('<div class="sec">API Settings</div>', unsafe_allow_html=True)
+        asset   = st.selectbox("Asset Class", ["forex","crypto","indices","stocks","etfs"])
+        sym     = st.text_input("Symbol", "eur_usd", help="e.g. eur_usd  btc_usd  aapl")
+        tf      = st.selectbox("Timeframe", ["1m","5m","15m","1h"])
+        c1,c2   = st.columns(2)
+        yr_s    = c1.number_input("From",2019,2025,2020,1)
+        yr_e    = c2.number_input("To",  2019,2025,2024,1)
+        sym_path = f"{asset}/{sym}"
+        years    = tuple(range(int(yr_s), int(yr_e)+1))
+        upload   = None
     else:
-        st.markdown('<div class="section-label">Global Analytics</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div style="font-size:.73rem;color:{C["t2"]};margin-bottom:14px">'
-            f'Click any cell to drill into that window. Showing aggregate below.</div>',
-            unsafe_allow_html=True)
-        render_analytics(ft, "All Filtered Trades")
+        upload   = st.file_uploader("File", type=["csv","gz"])
+        tf       = "1m"; sym_path = "uploaded"; years = ()
+
+    st.markdown('<div class="sec">Fixed Constant</div>', unsafe_allow_html=True)
+    sess_hr   = st.slider("Session Hour (UTC)", 0, 23, 8)
+    box_mins  = st.slider("Box Duration (min)",  1, 60,  5)
+    direction = st.selectbox("Direction", ["both","short","long"])
+
+    st.markdown('<div class="sec">Forward Test</div>', unsafe_allow_html=True)
+    use_fwd  = st.checkbox("Enable Forward Test", True)
+    fwd_cut  = st.date_input("Cut-off Date", value=date(2024,7,1)) if use_fwd else None
+
+    st.markdown('<div class="sec">Risk</div>', unsafe_allow_html=True)
+    spread   = st.number_input("Spread (pips)", 0.1, 10.0, 1.2, 0.1)
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    load_btn = st.button("LOAD DATA")
+
+# ── SESSION STATE ────────────────────────────────────────────
+for k in ["df","box","meas","derive_res","best","val_res"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+# ── LOAD ─────────────────────────────────────────────────────
+if load_btn:
+    with st.spinner("Loading…"):
+        if "API" in source:
+            raw = fetch_api(years, sym_path, tf)
+        elif upload is not None:
+            raw = parse_upload(upload.read(), upload.name)
+        else:
+            raw = pd.DataFrame()
+
+    if raw.empty:
+        st.sidebar.error("No data loaded.")
+    else:
+        st.session_state["df"] = standardise(raw)
+        for k in ["box","meas","derive_res","best","val_res"]:
+            st.session_state[k] = None
+        st.sidebar.success(f"Loaded {len(st.session_state['df']):,} rows")
+
+# ════════════════════════════════════════════════════════════
+#  HEADER
+# ════════════════════════════════════════════════════════════
+st.markdown("""
+<div style='border-bottom:1px solid #1a1a1a;padding-bottom:14px;margin-bottom:6px;'>
+  <span style='font-size:21px;font-weight:700;letter-spacing:.04em;'>MAE / MFE PIPELINE</span>
+  <span style='font-size:9.5px;color:#3a3a3a;letter-spacing:.15em;margin-left:18px;'>
+    FIXED CONSTANT  ·  RAW MEASUREMENT  ·  MARKOV  ·  REGIME  ·  DERIVE  ·  VALIDATE  ·  FORWARD
+  </span>
+</div>
+""", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════
+#  TABS
+# ════════════════════════════════════════════════════════════
+tabs = st.tabs([
+    "OVERVIEW",
+    "DATA",
+    "STEPS 3-4  MEASUREMENT",
+    "STEP 5  MARKOV",
+    "STEP 6  REGIME",
+    "STEP 7  DERIVE",
+    "STEP 8  VALIDATE",
+    "FORWARD TEST",
+])
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ──────────────────────────────────────────────────────────────────────────────
-def render_sidebar() -> dict:
-    with st.sidebar:
+# ─────────────────────────────────────────────────────────────
+#  TAB 0 — OVERVIEW
+# ─────────────────────────────────────────────────────────────
+with tabs[0]:
+    st.markdown('<div class="sec">The Eight-Step Pipeline</div>', unsafe_allow_html=True)
+    for num, title, desc in [
+        ("01","FIXED CONSTANT",
+         "A deterministic price level. Same data in, same number out. Known before decisions are made."),
+        ("02","RAW MEASUREMENT",
+         "For every instance of the level, measure MAE and MFE across 1h, 2h, 3h holds. No filters."),
+        ("03","MARKOV CHAIN",
+         "Rho = MAE growth / MFE growth. Below 1 = momentum. Above 1 = win-rate. Drives exit strategy."),
+        ("04","REGIME SWITCHING",
+         "Split 1,250 measurements by volatility regime. Same level, different edge in calm vs volatile."),
+        ("05","DERIVE",
+         "Test 300+ stop/target/queen combinations. Grade each with ten metrics per regime."),
+        ("06","VALIDATE",
+         "Seven-gate stress test. Perturbation, deflated Sharpe, cost survival, walk-forward, Monte Carlo."),
+        ("07","FORWARD TEST",
+         "Apply validated parameters to held-out recent data before a single dollar of capital is at risk."),
+    ]:
         st.markdown(f"""
-        <div style="padding:18px 0 20px;border-bottom:1px solid {C['border']};margin-bottom:14px">
-          <div style="font-size:.60rem;color:{C['t3']};letter-spacing:.14em;text-transform:uppercase;margin-bottom:5px">Strategy Engine</div>
-          <div style="font-size:.95rem;font-weight:600;color:{C['t0']}">⚡ Fake Breakout</div>
-          <div style="font-size:.62rem;color:{C['t3']};margin-top:3px">MAE · MFE · Regime Analyzer</div>
+        <div class="step-box">
+          <div class="step-num">STEP {num}</div>
+          <div class="step-ttl">{title}</div>
+          <div class="step-dsc">{desc}</div>
         </div>""", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-label">Data Source</div>', unsafe_allow_html=True)
-        src = st.radio("_src", ["Upload File","Local Path"], label_visibility="collapsed")
-        uploaded, local_path = None, ""
-        if src == "Upload File":
-            uploaded = st.file_uploader("_up", type=["csv","parquet"], label_visibility="collapsed")
+    st.markdown('<div class="sec">Core Concepts</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("""<div class="kpi"><div class="kpi-lbl">MAE</div>
+          <div class="kpi-val">Adverse</div>
+          <div class="kpi-sub">Maximum adverse excursion from the fixed constant. How far price moves against you before the trade resolves.</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown("""<div class="kpi"><div class="kpi-lbl">MFE</div>
+          <div class="kpi-val">Favorable</div>
+          <div class="kpi-sub">Maximum favorable excursion. How far price moves in your direction within the hold period.</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown("""<div class="kpi"><div class="kpi-lbl">RHO</div>
+          <div class="kpi-val">Edge Type</div>
+          <div class="kpi-sub">MAE growth / MFE growth across hold periods. Determines whether you trade momentum or win-rate.</div>
+        </div>""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────
+#  TAB 1 — DATA
+# ─────────────────────────────────────────────────────────────
+with tabs[1]:
+    df = st.session_state.get("df")
+    if df is None:
+        st.info("Configure the sidebar and click LOAD DATA.")
+    else:
+        max_date = df["ts"].dt.date.max()
+        min_date = df["ts"].dt.date.min()
+        train_end = (fwd_cut - timedelta(days=1)) if fwd_cut else max_date
+        train_df  = date_slice(df, min_date, train_end)
+        fwd_df    = date_slice(df, fwd_cut, max_date) if fwd_cut else pd.DataFrame()
+
+        st.markdown('<div class="sec">Dataset Summary</div>', unsafe_allow_html=True)
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Total Rows", f"{len(df):,}")
+        c2.metric("Train Rows", f"{len(train_df):,}")
+        c3.metric("Forward Rows", f"{len(fwd_df):,}")
+        c4.metric("Date Span", f"{min_date}  to  {max_date}")
+
+        st.markdown('<div class="sec">Sample Rows</div>', unsafe_allow_html=True)
+        st.dataframe(df.head(60), use_container_width=True, height=280)
+
+        st.markdown('<div class="sec">Fixed Constant Preview</div>', unsafe_allow_html=True)
+        if st.button("COMPUTE BOX LEVELS"):
+            with st.spinner("Computing…"):
+                b = compute_box(train_df, sess_hr, box_mins)
+                st.session_state["box"] = b
+
+        box = st.session_state.get("box")
+        if box is not None:
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Trading Days",  f"{len(box):,}")
+            c2.metric("Avg Box Range", f"{box['box_range'].mean():.1f} pips")
+            c3.metric("Max Box Range", f"{box['box_range'].max():.1f} pips")
+
+            # Box range distribution
+            fig, ax = plt.subplots(figsize=(10,3.5))
+            ax.hist(box["box_range"].clip(upper=box["box_range"].quantile(0.98)),
+                    bins=60, color="#e0e0e0", edgecolor="none", alpha=0.9)
+            ax.axvline(box["box_range"].median(), color="#666", linestyle="--",
+                       linewidth=1, label=f"Median {box['box_range'].median():.1f}")
+            ax.set_xlabel("Box Range (pips)")
+            ax.set_title(f"Fixed Constant — Box Range Distribution  |  {sess_hr:02d}:{box_mins:02d} UTC")
+            ax.legend(); ax.grid(True, alpha=0.3)
+            plt.tight_layout(); st.pyplot(fig); plt.close(fig)
+
+            st.dataframe(box.tail(30), use_container_width=True, height=250)
+
+
+# ─────────────────────────────────────────────────────────────
+#  TAB 2 — MEASUREMENT
+# ─────────────────────────────────────────────────────────────
+with tabs[2]:
+    df  = st.session_state.get("df")
+    box = st.session_state.get("box")
+
+    if df is None:
+        st.info("Load data first.")
+    elif box is None:
+        st.info("Compute box levels in the DATA tab.")
+    else:
+        train_end = (fwd_cut - timedelta(days=1)) if fwd_cut else df["ts"].dt.date.max()
+        train_df  = date_slice(df, df["ts"].dt.date.min(), train_end)
+
+        if st.button("RUN MEASUREMENT"):
+            prog = st.progress(0, "Measuring MAE / MFE…")
+            meas = compute_measurements(train_df, box, sess_hr, box_mins,
+                                         direction, [1,2,3])
+            prog.progress(70, "Labelling regimes…")
+            meas = add_regime(meas)
+            st.session_state["meas"] = meas
+            prog.progress(100, "Done.")
+            prog.empty()
+
+        meas = st.session_state.get("meas")
+        if meas is None:
+            st.info("Click RUN MEASUREMENT.")
+        elif len(meas) == 0:
+            st.warning("No measurements found. Check session hour and box duration settings.")
         else:
-            local_path = st.text_input("_lp", placeholder="/data/nq_1m.parquet",
-                                       label_visibility="collapsed")
-        years = st.slider("Years of data", 1, 10, 3)
+            dirs = sorted(meas["direction"].unique())
+            d_sel = st.selectbox("Direction", dirs)
+            m = meas[meas["direction"] == d_sel]
+            all_dates = sorted(m["date"].unique())
+            n = len(all_dates)
 
-        st.markdown('<div class="section-label">Range</div>', unsafe_allow_html=True)
-        tf = st.selectbox("Range TF", ["1m","5m","15m","1h"], index=1,
-                          help="Consolidation window. Breakout trigger = first 1-min bar that breaks out.")
-        st.markdown(
-            f'<div style="font-size:.62rem;color:{C["t3"]};margin:-4px 0 10px">'
-            f'Trigger: <span style="color:{C["green"]}">1-min close</span></div>',
-            unsafe_allow_html=True)
-        custom = st.checkbox("Custom Window")
-        cs = ce = ""
-        if custom:
-            ca, cb = st.columns(2)
-            cs = ca.text_input("Start","09:30",key="cs")
-            ce = cb.text_input("End",  "09:35",key="ce")
+            win = {
+                "5Y": all_dates,
+                "1Y": all_dates[-252:] if n >= 252 else all_dates,
+                "90D": all_dates[-63:]  if n >= 63  else all_dates,
+            }
 
-        st.markdown('<div class="section-label">Risk</div>', unsafe_allow_html=True)
-        risk_lbl  = st.selectbox("Risk Mode", ["Fixed %","ATR-Based"])
-        risk_mode = "atr" if risk_lbl=="ATR-Based" else "fixed_pct"
-        sl_k = st.number_input(
-            "SL mult (×ATR)" if risk_mode=="atr" else "Stop Loss %",
-            0.05, 10.0, 1.5 if risk_mode=="atr" else 0.5, 0.05, format="%.2f")
-        tp_lbl  = st.selectbox("TP Mode",
-                               ["Opposite Side of Range","Fixed %","Realized Vol of Range"])
-        tp_mode = {"Opposite Side of Range":"range","Fixed %":"fixed_pct",
-                   "Realized Vol of Range":"vol"}[tp_lbl]
-        tp_k = 1.0
-        if tp_mode != "range":
-            tp_k = st.number_input("TP mult" if tp_mode=="vol" else "TP %",
-                                   0.05, 10.0, 1.0, 0.05, format="%.2f")
+            # ── Percentile tables ──
+            st.markdown('<div class="sec">Percentile Tables — MAE and MFE (pips)</div>',
+                        unsafe_allow_html=True)
+            for hold in [1,2,3]:
+                st.markdown(f"**{hold}H Hold**")
+                pct_rows = []
+                for wname, wdates in win.items():
+                    hw = m[(m["hold"]==hold) & (m["date"].isin(wdates))]
+                    if len(hw) < 10: continue
+                    row = {"Window":wname, "N":len(hw)}
+                    for metric in ["mae","mfe"]:
+                        p = pct_table(hw[metric])
+                        for k,v in p.items():
+                            row[f"{metric.upper()} {k}"] = f"{v:.1f}"
+                    pct_rows.append(row)
+                if pct_rows:
+                    st.dataframe(pd.DataFrame(pct_rows).set_index("Window"),
+                                 use_container_width=True)
 
-        st.markdown('<div class="section-label">Filter</div>', unsafe_allow_html=True)
-        direction = st.multiselect("Direction", ["short","long"], default=["short","long"])
+            # ── Distributions ──
+            st.markdown('<div class="sec">Distributions</div>', unsafe_allow_html=True)
+            h_sel = st.select_slider("Hold Period", [1,2,3], value=1)
+            hd = m[m["hold"] == h_sel]
+            if len(hd) > 5:
+                fig, axes = plt.subplots(1,2,figsize=(13,4))
+                for ax, col, lbl in zip(axes, ["mae","mfe"], ["MAE","MFE"]):
+                    data = hd[col].dropna()
+                    clip = np.percentile(data, 97)
+                    ax.hist(data[data <= clip*1.2], bins=55, color="#e0e0e0",
+                            edgecolor="none", alpha=0.88)
+                    for p,ls in [(50,"--"),(90,":")]:
+                        v = np.percentile(data,p)
+                        ax.axvline(v, color="#666", linewidth=1, linestyle=ls,
+                                   label=f"P{p} = {v:.1f}")
+                    ax.set_title(f"{lbl}  —  {h_sel}H  —  {d_sel.upper()}")
+                    ax.set_xlabel("pips"); ax.legend(); ax.grid(True,alpha=0.3)
+                plt.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-        st.markdown("---")
-        run = st.button("⚡  Run Backtest", use_container_width=True)
-
-        return dict(src=src, uploaded=uploaded, local_path=local_path, years=years,
-                    tf=tf, custom_range=custom, c_start=cs, c_end=ce,
-                    risk_mode=risk_mode, sl_k=sl_k, tp_mode=tp_mode, tp_k=tp_k,
-                    direction=direction, run=run)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# WELCOME
-# ──────────────────────────────────────────────────────────────────────────────
-def render_welcome() -> None:
-    st.markdown(f"""
-    <div style="margin:48px auto;max-width:640px;text-align:center">
-      <div style="font-size:2.5rem;margin-bottom:12px">⚡</div>
-      <div style="font-size:1.1rem;font-weight:600;color:{C['t0']};margin-bottom:10px">Fake Breakout Backtest Engine</div>
-      <div style="font-size:.78rem;color:{C['t2']};line-height:1.9;margin-bottom:26px">
-        Find repeatable time-of-day setups by measuring how far price moves toward<br>
-        your target (MFE) versus against you (MAE) after a fake breakout.<br>
-        No P&amp;L tracking. Just structure.
-      </div>
-      <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:32px">
-        <span class="badge badge-green">1-min Breakout Trigger</span>
-        <span class="badge badge-green">MAE · MFE · Regime Analysis</span>
-        <span class="badge badge-dim">ATR / Vol Risk</span>
-        <span class="badge badge-dim">Parquet / CSV · 200MB+</span>
-      </div>
-      <div style="background:{C['bg2']};border:1px solid {C['border']};border-radius:8px;padding:18px 22px;text-align:left">
-        <div style="font-size:.58rem;color:{C['t3']};letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px">Expected Schema</div>
-        <code style="font-size:.70rem;color:{C['t2']};line-height:1.9;font-family:'Geist Mono',monospace;white-space:pre"><span style="color:{C['t3']}">timestamp            open      high      low       close   volume  adx_14  atr_14  zscore_20</span>
-<span style="color:{C['green']}">2022-01-03T09:29:00</span>  <span style="color:{C['t1']}">1828.72   1829.19   1828.72   1829.07  25      31.1    0.3     2.84</span></code>
-      </div>
-    </div>""", unsafe_allow_html=True)
+            # ── Box range vs MAE scatter ──
+            st.markdown('<div class="sec">Box Range vs 1H MAE</div>', unsafe_allow_html=True)
+            h1 = m[m["hold"]==1]
+            if len(h1) > 10:
+                fig2, ax2 = plt.subplots(figsize=(10,4))
+                ax2.scatter(h1["box_range"], h1["mae"], s=7, alpha=0.25, color="#e0e0e0")
+                v = h1[["box_range","mae"]].dropna()
+                if len(v) > 20:
+                    z = np.polyfit(v["box_range"], v["mae"], 1)
+                    xr = np.linspace(v["box_range"].quantile(.02), v["box_range"].quantile(.95), 100)
+                    ax2.plot(xr, np.poly1d(z)(xr), color="#888", linewidth=1.5, label="OLS trend")
+                ax2.set_xlabel("Box Range (pips)"); ax2.set_ylabel("MAE (pips)")
+                ax2.set_title("Box Range as MAE Predictor")
+                ax2.legend(); ax2.grid(True, alpha=0.3)
+                plt.tight_layout(); st.pyplot(fig2); plt.close(fig2)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────────────────────────────────
-def main() -> None:
-    inject_css()
-    st.markdown(f"""
-    <div class="top-header">
-      <div class="pulse"></div>
-      <div>
-        <div class="title">Fake Breakout Backtest</div>
-        <div class="sub">MAE · MFE · Regime Discovery — 1-min Trigger Engine</div>
-      </div>
-      <span class="badge badge-green" style="margin-left:auto">LIVE</span>
-    </div>""", unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────
+#  TAB 3 — MARKOV
+# ─────────────────────────────────────────────────────────────
+with tabs[3]:
+    meas = st.session_state.get("meas")
+    if meas is None:
+        st.info("Complete the Measurement step.")
+    else:
+        st.markdown('<div class="sec">Rho Classification Across Lookback Windows</div>',
+                    unsafe_allow_html=True)
+        dirs = sorted(meas["direction"].unique())
 
-    for k, v in [("trades",None),("df",None),("selected_cell",None)]:
-        if k not in st.session_state:
-            st.session_state[k] = v
+        for dr in dirs:
+            m = meas[meas["direction"] == dr]
+            all_dates = sorted(m["date"].unique())
+            n = len(all_dates)
+            win = {
+                "Five Year":  all_dates,
+                "One Year":   all_dates[-252:] if n >= 252 else all_dates,
+                "Ninety Day": all_dates[-63:]  if n >= 63  else all_dates,
+            }
+            st.markdown(f"**Direction: {dr.upper()}**")
+            rho_rows = []
+            rho_vals  = {}
+            for wname, wdates in win.items():
+                r = compute_rho(meas, dr, wdates)
+                if not r: continue
+                rho_rows.append({
+                    "Window": wname, "N": len([d for d in all_dates if d in wdates]),
+                    "MAE P50 1H": f"{r['mae_medians'][0]:.1f}",
+                    "MAE P50 3H": f"{r['mae_medians'][-1]:.1f}",
+                    "MFE P50 1H": f"{r['mfe_medians'][0]:.1f}",
+                    "MFE P50 3H": f"{r['mfe_medians'][-1]:.1f}",
+                    "MAE Growth": f"{r['mae_growth']:.2f}x",
+                    "MFE Growth": f"{r['mfe_growth']:.2f}x",
+                    "Rho": f"{r['rho']:.3f}",
+                    "Edge": r["edge"],
+                })
+                rho_vals[wname] = r
 
-    p = render_sidebar()
+            if rho_rows:
+                st.dataframe(pd.DataFrame(rho_rows).set_index("Window"),
+                             use_container_width=True)
 
-    # load
-    df_raw = None
-    if p["src"] == "Upload File" and p["uploaded"]:
-        f = p["uploaded"]
-        with st.spinner(f"Loading {f.name} …"):
-            try:
-                rb = f.read()
-                df_raw = pd.read_parquet(io.BytesIO(rb)) if f.name.endswith(".parquet") else _load_csv(rb)
-            except Exception as e:
-                st.error(f"Load error: {e}"); return
-    elif p["src"] == "Local Path" and p["local_path"].strip():
-        path = Path(p["local_path"].strip())
-        if not path.exists():
-            st.error(f"Not found: {path}"); return
-        with st.spinner(f"Loading {path.name} …"):
-            try:
-                df_raw = _load_parquet(str(path)) if str(path).endswith(".parquet") else _load_csv(path.read_bytes())
-            except Exception as e:
-                st.error(f"Load error: {e}"); return
+            # Growth chart
+            if rho_vals:
+                fig, ax = plt.subplots(figsize=(10,3.8))
+                colors = {"Five Year":"#e0e0e0","One Year":"#777","Ninety Day":"#333"}
+                for wname, r in rho_vals.items():
+                    hs = r["holds"]
+                    ax.plot(hs, r["mae_medians"], color=colors[wname], linestyle="-",
+                            linewidth=1.4, label=f"{wname} MAE")
+                    ax.plot(hs, r["mfe_medians"], color=colors[wname], linestyle="--",
+                            linewidth=1.4, label=f"{wname} MFE")
+                ax.axhline(0, color="#333", linewidth=.5)
+                ax.set_xticks([1,2,3])
+                ax.set_xlabel("Hold Period (hours)"); ax.set_ylabel("Median (pips)")
+                ax.set_title(f"MAE / MFE Growth  —  {dr.upper()}")
+                ax.legend(loc="upper left", fontsize=7); ax.grid(True, alpha=0.3)
+                plt.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-    if df_raw is None:
-        render_welcome(); return
-
-    with st.spinner("Preprocessing …"):
-        try:
-            df = preprocess(df_raw, p["years"])
-        except Exception as e:
-            st.error(f"Preprocessing error: {e}"); return
-    st.session_state["df"] = df
-
-    # summary
-    mem   = df.memory_usage(deep=True).sum() / 1024**2
-    ndays = df["_date"].nunique()
-    cols  = st.columns(5)
-    for col, lbl, val in [
-        (cols[0],"Bars",f"{len(df):,}"), (cols[1],"Days",f"{ndays:,}"),
-        (cols[2],"From",df.index[0].strftime("%Y-%m-%d")),
-        (cols[3],"To",  df.index[-1].strftime("%Y-%m-%d")),
-        (cols[4],"RAM", f"{mem:.1f} MB"),
-    ]:
-        col.markdown(kpi(lbl, val), unsafe_allow_html=True)
-
-    feat_ok = [c for c in ["adx_14","atr_14","zscore_20"] if c in df.columns]
-    if feat_ok:
-        st.markdown(
-            '<div style="margin-top:8px">'
-            + "".join(f'<span class="badge badge-green" style="margin-right:6px">{f}</span>' for f in feat_ok)
-            + '</div>', unsafe_allow_html=True)
-    if p["risk_mode"]=="atr" and "atr_14" not in df.columns:
-        st.warning("⚠️ ATR-Based risk selected but atr_14 not in dataset — falling back to fixed %.")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # run
-    if p["run"]:
-        st.session_state["selected_cell"] = None
-        tf_min = TF_MINUTES[p["tf"]]
-        cs = p["c_start"] if p["custom_range"] else ""
-        ce = p["c_end"]   if p["custom_range"] else ""
-        with st.spinner("Detecting breakouts on 1-min bars …"):
-            signals = compute_signals(df, tf_min, cs, ce)
-        if signals.empty:
-            st.warning("No signals found."); st.session_state["trades"] = pd.DataFrame(); return
-        prog = st.progress(0, text=f"Simulating {len(signals):,} trades …")
-        trades = simulate_trades(df, signals,
-                                 risk_mode=p["risk_mode"], sl_k=p["sl_k"],
-                                 tp_mode=p["tp_mode"],     tp_k=p["tp_k"])
-        prog.progress(100, text="Done."); prog.empty()
-        st.session_state["trades"] = trades
-
-    if st.session_state["trades"] is None:
-        st.info("Configure parameters and click **⚡ Run Backtest**."); return
-
-    trades_all = st.session_state["trades"]
-    if trades_all.empty:
-        st.warning("No trades generated."); return
-
-    ft = trades_all.copy()
-    if p["direction"]:
-        ft = ft[ft["direction"].isin(p["direction"])]
-    if ft.empty:
-        st.warning("No trades after direction filter."); return
-
-    heatmap_section(ft, p)
+                # 1Y rho callout
+                r1y = rho_vals.get("One Year", list(rho_vals.values())[-1])
+                st.markdown(f"""
+                <div class="kpi" style="margin-top:14px;max-width:340px;">
+                  <div class="kpi-lbl">One-Year Rho  —  {dr.upper()}</div>
+                  <div class="kpi-val">{r1y['rho']:.3f}</div>
+                  <div class="kpi-sub">{r1y['edge']}  &mdash;  {"hold to close, no target" if r1y['edge']=="WIN-RATE" else "use take-profit target"}</div>
+                </div>""", unsafe_allow_html=True)
+            st.markdown("<hr>", unsafe_allow_html=True)
 
 
-if __name__ == "__main__":
-    main()
+# ─────────────────────────────────────────────────────────────
+#  TAB 4 — REGIME
+# ─────────────────────────────────────────────────────────────
+with tabs[4]:
+    meas = st.session_state.get("meas")
+    if meas is None:
+        st.info("Complete the Measurement step.")
+    else:
+        st.markdown('<div class="sec">Regime Distribution</div>', unsafe_allow_html=True)
+        rc = meas.drop_duplicates("date")["regime"].value_counts()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Calm Days",    rc.get("calm", 0))
+        c2.metric("Volatile Days", rc.get("volatile", 0))
+        c3.metric("Volatile %",
+                  f"{rc.get('volatile',0)/(rc.sum() or 1)*100:.1f}%")
+
+        dr_opts = sorted(meas["direction"].unique())
+        dr = st.selectbox("Direction", dr_opts, key="rg_dir")
+        m  = meas[meas["direction"] == dr]
+        all_dates = sorted(m["date"].unique())
+        n = len(all_dates)
+        oney = all_dates[-252:] if n >= 252 else all_dates
+        m1y  = m[m["date"].isin(oney)]
+
+        st.markdown('<div class="sec">Regime-Split Metrics — 1Y Window</div>',
+                    unsafe_allow_html=True)
+        reg_rows = []
+        for rg in ["calm","volatile"]:
+            for hold in [1,2,3]:
+                hw = m1y[(m1y["regime"]==rg) & (m1y["hold"]==hold)]
+                if len(hw) < 10: continue
+                # compute rho vs 1h baseline
+                h1 = m1y[(m1y["regime"]==rg) & (m1y["hold"]==1)]
+                if hold > 1 and len(h1) > 0 and h1["mae"].median() > 0:
+                    rho = (hw["mae"].median() / h1["mae"].median()) / \
+                          (hw["mfe"].median() / max(h1["mfe"].median(), 0.001))
+                    rho_s = f"{rho:.3f}"
+                else:
+                    rho_s = "—"
+                reg_rows.append({
+                    "Regime": rg.upper(), "Hold": f"{hold}H", "N": len(hw),
+                    "MAE P50": f"{hw['mae'].median():.1f}",
+                    "MAE P90": f"{np.percentile(hw['mae'],90):.1f}",
+                    "MFE P50": f"{hw['mfe'].median():.1f}",
+                    "MFE P90": f"{np.percentile(hw['mfe'],90):.1f}",
+                    "Rho*":     rho_s,
+                })
+        if reg_rows:
+            st.dataframe(pd.DataFrame(reg_rows), use_container_width=True)
+
+        # Distribution comparison
+        st.markdown('<div class="sec">MAE / MFE Distribution by Regime — 1H Hold</div>',
+                    unsafe_allow_html=True)
+        h_data = m1y[m1y["hold"]==1]
+        if len(h_data) > 10:
+            fig, axes = plt.subplots(1,2,figsize=(13,4))
+            for ax, col, lbl in zip(axes, ["mae","mfe"], ["MAE","MFE"]):
+                for rg, clr, ls in [("calm","#e0e0e0","-"),("volatile","#777","--")]:
+                    d = h_data[h_data["regime"]==rg][col].dropna()
+                    if len(d) < 5: continue
+                    clip = np.percentile(d, 96)
+                    ax.hist(d[d<=clip*1.3], bins=40, color=clr, alpha=0.55,
+                            edgecolor="none", label=rg, density=True)
+                ax.set_title(f"{lbl}  by Regime  —  1H  —  {dr.upper()}")
+                ax.set_xlabel("pips"); ax.legend(); ax.grid(True, alpha=0.3)
+            plt.tight_layout(); st.pyplot(fig); plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────
+#  TAB 5 — DERIVE
+# ─────────────────────────────────────────────────────────────
+with tabs[5]:
+    meas = st.session_state.get("meas")
+    if meas is None:
+        st.info("Complete the Measurement step.")
+    else:
+        st.markdown('<div class="sec">Combination Testing</div>', unsafe_allow_html=True)
+
+        dr_opts = sorted(meas["direction"].unique())
+        d_col, h_col = st.columns(2)
+        der_dir  = d_col.selectbox("Direction", dr_opts, key="der_dir")
+        der_hold = h_col.select_slider("Hold Period", [1,2,3], value=1, key="der_hold")
+
+        m = meas[(meas["direction"]==der_dir) & (meas["hold"]==der_hold)]
+        if len(m) < 50:
+            st.warning("Not enough measurements for reliable derive step (need 50+).")
+        else:
+            mae_v = m["mae"].dropna(); mfe_v = m["mfe"].dropna()
+            stops   = [(p, float(np.percentile(mae_v,p))) for p in [30,50,70,90]]
+            targets = [(p, float(np.percentile(mfe_v,p))) for p in [30,50,70,90,95]]
+            queens  = [(p, float(np.percentile(mfe_v,p))) for p in [10,30,50]]
+            n_combos = len(stops)*len(targets)*len(queens)
+
+            st.markdown(f"""
+            <div class="step-box" style="margin-bottom:14px;">
+              <div class="step-num">COMBINATION SPACE</div>
+              <div class="step-ttl">{n_combos} combinations  &times;  {len(m)} measurements</div>
+              <div class="step-dsc">
+                Stops: MAE P30 / P50 / P70 / P90  |
+                Targets: MFE P30 / P50 / P70 / P90 / P95  |
+                Queen: MFE P10 / P30 / P50
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            if st.button("RUN DERIVE"):
+                results = []
+                prog = st.progress(0, "Testing…")
+                total = n_combos; done = 0
+                for sp, sv in stops:
+                    for tp, tv in targets:
+                        for qp, qv in queens:
+                            tr = simulate(m, sv, tv, qv, spread)
+                            g  = grade(tr)
+                            if g:
+                                results.append({
+                                    "Stop":   f"MAE P{sp}",
+                                    "Target": f"MFE P{tp}",
+                                    "Queen":  f"MFE P{qp}",
+                                    "Stop pips":   f"{sv:.1f}",
+                                    "Tgt pips":    f"{tv:.1f}",
+                                    "N":           g["n"],
+                                    "Win Rate":    f"{g['win_rate']:.1%}",
+                                    "EV pips":     f"{g['ev']:.2f}",
+                                    "Prof Factor": f"{g['profit_factor']:.2f}",
+                                    "Sharpe":      f"{g['sharpe']:.2f}",
+                                    "SQN":         f"{g['sqn']:.2f}",
+                                    "Max DD":      f"{g['max_dd']:.1f}",
+                                    "Kelly":       f"{g['kelly']:.3f}",
+                                    "_pf":    g["profit_factor"],
+                                    "_ev":    g["ev"],
+                                    "_stop":  sv,
+                                    "_tgt":   tv,
+                                    "_queen": qv,
+                                    "_sp":    sp, "_tp":    tp,
+                                    "_grade": g,
+                                })
+                            done += 1
+                            prog.progress(done/total)
+                prog.empty()
+                if results:
+                    rdf = pd.DataFrame(results).sort_values("_pf", ascending=False)
+                    st.session_state["derive_res"] = rdf
+                    best = rdf.iloc[0]
+                    st.session_state["best"] = {
+                        "stop":  best["_stop"], "target": best["_tgt"],
+                        "queen": best["_queen"], "grade": best["_grade"],
+                        "direction": der_dir, "hold": der_hold,
+                        "stop_pct": best["_sp"], "tgt_pct": best["_tp"],
+                    }
+
+            rdf = st.session_state.get("derive_res")
+            if rdf is not None and len(rdf) > 0:
+                show_cols = ["Stop","Target","Queen","Stop pips","Tgt pips",
+                             "N","Win Rate","EV pips","Prof Factor",
+                             "Sharpe","SQN","Max DD","Kelly"]
+                st.markdown('<div class="sec">Results — Top 30 by Profit Factor</div>',
+                            unsafe_allow_html=True)
+                st.dataframe(rdf[show_cols].head(30), use_container_width=True, height=380)
+
+                best = rdf.iloc[0]
+                st.markdown(f"""
+                <div class="kpi" style="margin-top:14px;">
+                  <div class="kpi-lbl">Best Combination</div>
+                  <div class="kpi-val">{best['Stop pips']} / {best['Tgt pips']} pips</div>
+                  <div class="kpi-sub">
+                    {best['Stop']} stop  &middot;  {best['Target']} target  &middot;  {best['Queen']} queen
+                    &mdash;  Win Rate {best['Win Rate']}  &middot;  PF {best['Prof Factor']}  &middot;  EV {best['EV pips']} pips
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+                # PF Heatmap
+                st.markdown('<div class="sec">Profit Factor Heatmap — Stop vs Target</div>',
+                            unsafe_allow_html=True)
+                hm = (rdf.groupby(["Stop","Target"])["_pf"]
+                        .mean().reset_index()
+                        .pivot(index="Stop", columns="Target", values="_pf"))
+                if not hm.empty:
+                    fig, ax = plt.subplots(figsize=(11,4))
+                    vals = hm.values.clip(0, 3)
+                    im = ax.imshow(vals, cmap="Greys", aspect="auto", vmin=0, vmax=2.5)
+                    ax.set_xticks(range(len(hm.columns)))
+                    ax.set_xticklabels(hm.columns, rotation=45, ha="right", fontsize=8)
+                    ax.set_yticks(range(len(hm.index)))
+                    ax.set_yticklabels(hm.index, fontsize=8)
+                    ax.set_xlabel("Take Profit"); ax.set_ylabel("Stop Loss")
+                    ax.set_title("Mean Profit Factor  (brighter = higher)")
+                    plt.colorbar(im, ax=ax, shrink=0.8)
+                    for i in range(len(hm.index)):
+                        for j in range(len(hm.columns)):
+                            v = vals[i,j]
+                            if not np.isnan(v):
+                                ax.text(j, i, f"{v:.1f}", ha="center", va="center",
+                                        fontsize=7.5,
+                                        color="black" if v > 1.2 else "#888")
+                    plt.tight_layout(); st.pyplot(fig); plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────
+#  TAB 6 — VALIDATE
+# ─────────────────────────────────────────────────────────────
+with tabs[6]:
+    best = st.session_state.get("best")
+    meas = st.session_state.get("meas")
+
+    if best is None:
+        st.info("Complete the Derive step first.")
+    else:
+        bc = best
+        m  = meas[(meas["direction"]==bc["direction"]) & (meas["hold"]==bc["hold"])]
+
+        st.markdown(f"""
+        <div class="step-box" style="margin-bottom:14px;">
+          <div class="step-num">VALIDATING COMBINATION</div>
+          <div class="step-ttl">Stop {bc['stop']:.1f} pips  &middot;  Target {bc['target']:.1f} pips  &middot;  Queen {bc['queen']:.1f} pips</div>
+          <div class="step-dsc">
+            Direction {bc['direction'].upper()}  &middot;  {bc['hold']}H hold  &middot;
+            Stop = MAE P{bc['stop_pct']}  &middot;  Target = MFE P{bc['tgt_pct']}
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        if st.button("RUN VALIDATION"):
+            with st.spinner("Running 7-gate stress test…"):
+                trades = simulate(m, bc["stop"], bc["target"], bc["queen"], spread)
+                g = grade(trades)
+                rdf = st.session_state.get("derive_res")
+                n_combos = len(rdf) if rdf is not None else 60
+                gates = run_gates(m, trades, g, n_combos,
+                                  bc["stop"], bc["target"], bc["queen"], spread)
+                st.session_state["val_res"] = {"trades":trades,"grade":g,"gates":gates}
+
+        val = st.session_state.get("val_res")
+        if val is not None:
+            g     = val["grade"]
+            gates = val["gates"]
+            trades= val["trades"]
+
+            # Grade card
+            st.markdown('<div class="sec">Grade Card</div>', unsafe_allow_html=True)
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("N Trades",      g["n"])
+            c2.metric("Win Rate",      f"{g['win_rate']:.1%}")
+            c3.metric("EV (pips)",     f"{g['ev']:.2f}")
+            c4.metric("Profit Factor", f"{g['profit_factor']:.2f}")
+            c5,c6,c7,c8 = st.columns(4)
+            c5.metric("Sharpe",        f"{g['sharpe']:.2f}")
+            c6.metric("SQN",           f"{g['sqn']:.2f}")
+            c7.metric("Max DD pips",   f"{g['max_dd']:.1f}")
+            c8.metric("Kelly",         f"{g['kelly']:.3f}")
+
+            # Gates
+            st.markdown('<div class="sec">Seven-Gate Stress Test</div>', unsafe_allow_html=True)
+            passed = 0; crit_fail = False
+            for gid, gdata in gates.items():
+                ok   = gdata["pass"]
+                crit = gdata["critical"]
+                if ok: passed += 1
+                if crit and not ok: crit_fail = True
+                badge = '<span class="pass">PASS</span>' if ok else '<span class="fail">FAIL</span>'
+                crit_tag = ' <span style="font-size:9px;color:#333;">[CRITICAL]</span>' if crit else ""
+                st.markdown(f"""
+                <div class="step-box">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-size:11.5px;">{gdata['label']}{crit_tag}</span>
+                    {badge}
+                  </div>
+                  <div style="font-size:9.5px;color:#4d4d4d;margin-top:5px;">{gdata['detail']}</div>
+                </div>""", unsafe_allow_html=True)
+
+            # Verdict
+            ok_color = "#e0e0e0" if not crit_fail else "#555"
+            verdict  = f"DEPLOY — {passed}/{len(gates)} gates passed" if not crit_fail \
+                       else f"REJECT — critical gate failed  ({passed}/{len(gates)} passed)"
+            st.markdown(f"""
+            <div style="border:1px solid {'#e0e0e0' if not crit_fail else '#2a2a2a'};
+                        padding:16px;margin-top:14px;background:#050505;">
+              <div style="font-size:9px;color:#3d3d3d;margin-bottom:5px;">VERDICT</div>
+              <div style="font-size:17px;font-weight:700;color:{ok_color};">{verdict}</div>
+            </div>""", unsafe_allow_html=True)
+
+            # Equity curve
+            st.markdown('<div class="sec">Equity Curve</div>', unsafe_allow_html=True)
+            ts = trades.sort_values("date").copy()
+            ts["cum"] = ts["pnl"].cumsum()
+            fig, ax = plt.subplots(figsize=(13,4))
+            ax.plot(range(len(ts)), ts["cum"], color="#e0e0e0", linewidth=1.2)
+            ax.fill_between(range(len(ts)), 0, ts["cum"],
+                            where=ts["cum"]>=0, alpha=0.08, color="#e0e0e0")
+            ax.fill_between(range(len(ts)), 0, ts["cum"],
+                            where=ts["cum"]<0,  alpha=0.15, color="#888")
+            ax.axhline(0, color="#2a2a2a", linewidth=.6)
+            ax.set_xlabel("Trade Number"); ax.set_ylabel("Cumulative P&L (pips)")
+            ax.set_title("Equity Curve — Validated Combination")
+            ax.grid(True, alpha=0.25)
+            plt.tight_layout(); st.pyplot(fig); plt.close(fig)
+
+            # Rolling win rate
+            st.markdown('<div class="sec">Rolling Win Rate (30-trade window)</div>',
+                        unsafe_allow_html=True)
+            ts["win_i"] = (ts["outcome"]=="win").astype(int)
+            ts["roll_wr"] = ts["win_i"].rolling(30, min_periods=10).mean()
+            fig2, ax2 = plt.subplots(figsize=(13,3))
+            ax2.plot(range(len(ts)), ts["roll_wr"]*100, color="#e0e0e0", linewidth=1)
+            ax2.axhline(g["win_rate"]*100, color="#555", linewidth=1, linestyle="--",
+                        label=f"Overall {g['win_rate']:.1%}")
+            ax2.set_ylim(0,100); ax2.set_xlabel("Trade"); ax2.set_ylabel("Win Rate %")
+            ax2.set_title("Rolling Win Rate"); ax2.legend()
+            ax2.grid(True, alpha=0.25)
+            plt.tight_layout(); st.pyplot(fig2); plt.close(fig2)
+
+
+# ─────────────────────────────────────────────────────────────
+#  TAB 7 — FORWARD TEST
+# ─────────────────────────────────────────────────────────────
+with tabs[7]:
+    df   = st.session_state.get("df")
+    best = st.session_state.get("best")
+
+    if not use_fwd:
+        st.info("Enable the Forward Test toggle in the sidebar.")
+    elif df is None:
+        st.info("Load data first.")
+    elif best is None:
+        st.info("Complete Derive and Validate steps first.")
+    else:
+        bc = best
+        max_date = df["ts"].dt.date.max()
+
+        st.markdown(f"""
+        <div class="step-box" style="margin-bottom:14px;">
+          <div class="step-num">FORWARD TEST CONFIGURATION</div>
+          <div class="step-ttl">Out-of-sample verification</div>
+          <div class="step-dsc">
+            Training period: {df['ts'].dt.date.min()}  to  {fwd_cut - timedelta(days=1)}<br>
+            Forward period:  {fwd_cut}  to  {max_date}<br>
+            Stop {bc['stop']:.1f} pips  &middot;  Target {bc['target']:.1f} pips  &middot;  Queen {bc['queen']:.1f} pips
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+        if st.button("RUN FORWARD TEST"):
+            with st.spinner("Running forward test…"):
+                fwd_df = date_slice(df, fwd_cut, max_date)
+                if len(fwd_df) < 200:
+                    st.warning(f"Only {len(fwd_df)} rows in forward period.")
+
+                fwd_box  = compute_box(fwd_df, sess_hr, box_mins)
+                fwd_meas = compute_measurements(fwd_df, fwd_box, sess_hr, box_mins,
+                                                 bc["direction"], [bc["hold"]])
+                fwd_meas = add_regime(fwd_meas)
+                fwd_meas = fwd_meas[fwd_meas["direction"]==bc["direction"]]
+
+                fwd_trades = simulate(fwd_meas, bc["stop"], bc["target"],
+                                      bc["queen"], spread)
+                fwd_grade  = grade(fwd_trades)
+
+                train_grade = bc["grade"]
+
+                # Comparison
+                st.markdown('<div class="sec">In-Sample vs Out-of-Sample</div>',
+                            unsafe_allow_html=True)
+                cols = st.columns(5)
+                for col, metric, lbl, fmt in zip(cols,
+                    ["n","win_rate","ev","profit_factor","sharpe"],
+                    ["N","Win Rate","EV pips","Prof Factor","Sharpe"],
+                    ["{:.0f}","{:.1%}","{:.2f}","{:.2f}","{:.2f}"]):
+                    iv = train_grade.get(metric,0)
+                    ov = fwd_grade.get(metric,0)
+                    col.metric(f"{lbl}", fmt.format(ov),
+                               delta=fmt.format(ov-iv))
+
+                # Equity curves side by side
+                st.markdown('<div class="sec">Equity Curves</div>', unsafe_allow_html=True)
+                val_res = st.session_state.get("val_res")
+                fig, axes = plt.subplots(1,2,figsize=(14,4))
+
+                for ax, tr, title in zip(
+                    axes,
+                    [val_res["trades"] if val_res else pd.DataFrame(), fwd_trades],
+                    ["In-Sample (Training)", "Out-of-Sample (Forward)"]
+                ):
+                    if len(tr) == 0:
+                        ax.set_title(title + " — No Data"); continue
+                    ts = tr.sort_values("date").copy()
+                    ts["cum"] = ts["pnl"].cumsum()
+                    ax.plot(range(len(ts)), ts["cum"], color="#e0e0e0", linewidth=1.2)
+                    ax.fill_between(range(len(ts)), 0, ts["cum"],
+                                    where=ts["cum"]>=0, alpha=0.08, color="#e0e0e0")
+                    ax.fill_between(range(len(ts)), 0, ts["cum"],
+                                    where=ts["cum"]<0,  alpha=0.15, color="#888")
+                    ax.axhline(0, color="#2a2a2a", linewidth=.6)
+                    ax.set_title(title); ax.set_xlabel("Trade")
+                    ax.set_ylabel("Cumulative P&L (pips)")
+                    ax.grid(True, alpha=0.25)
+                plt.tight_layout(); st.pyplot(fig); plt.close(fig)
+
+                # Regime breakdown
+                st.markdown('<div class="sec">Forward Period — Regime Breakdown</div>',
+                            unsafe_allow_html=True)
+                rg_rows = []
+                for rg in ["calm","volatile"]:
+                    rt = fwd_trades[fwd_trades["regime"]==rg]
+                    if len(rt) < 5: continue
+                    rg_g = grade(rt)
+                    rg_rows.append({
+                        "Regime": rg.upper(), "N": rg_g["n"],
+                        "Win Rate": f"{rg_g['win_rate']:.1%}",
+                        "EV pips": f"{rg_g['ev']:.2f}",
+                        "Prof Factor": f"{rg_g['profit_factor']:.2f}",
+                        "Sharpe": f"{rg_g['sharpe']:.2f}",
+                    })
+                if rg_rows:
+                    st.dataframe(pd.DataFrame(rg_rows), use_container_width=True)
+
+                # Win rate comparison chart
+                st.markdown('<div class="sec">Box Range vs MAE — Forward Period</div>',
+                            unsafe_allow_html=True)
+                h1f = fwd_meas[fwd_meas["hold"]==bc["hold"]]
+                if len(h1f) > 10:
+                    fig3, ax3 = plt.subplots(figsize=(10,3.5))
+                    ax3.scatter(h1f["box_range"], h1f["mae"], s=7, alpha=0.3, color="#e0e0e0")
+                    if len(h1f) > 20:
+                        v = h1f[["box_range","mae"]].dropna()
+                        z = np.polyfit(v["box_range"], v["mae"], 1)
+                        xr = np.linspace(v["box_range"].quantile(.02),
+                                         v["box_range"].quantile(.95), 100)
+                        ax3.plot(xr, np.poly1d(z)(xr), color="#888",
+                                 linewidth=1.5, label="OLS trend")
+                    ax3.set_xlabel("Box Range (pips)"); ax3.set_ylabel("MAE (pips)")
+                    ax3.set_title("Forward — Box Range vs MAE")
+                    ax3.legend(); ax3.grid(True, alpha=0.25)
+                    plt.tight_layout(); st.pyplot(fig3); plt.close(fig3)
