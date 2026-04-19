@@ -40,10 +40,22 @@ html, body, .stApp { background:#000 !important; color:#e0e0e0 !important; }
 /* Hide sidebar collapse button */
 [data-testid="collapsedControl"] { display: none !important; }
 
-/* Sidebar */
+/* Force sidebar always open */
 section[data-testid="stSidebar"] {
+  transform: translateX(0px) !important;
+  min-width: 244px !important;
+  width: 244px !important;
+  display: block !important;
+  visibility: visible !important;
   background:#070707 !important;
   border-right:1px solid #1d1d1d !important;
+}
+section[data-testid="stSidebar"][aria-expanded="false"] {
+  transform: translateX(0px) !important;
+  min-width: 244px !important;
+  width: 244px !important;
+  display: block !important;
+  visibility: visible !important;
 }
 section[data-testid="stSidebar"] * { color:#e0e0e0 !important; }
 
