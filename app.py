@@ -7,7 +7,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy import stats
-import io, requests, warnings
+import io, requests, warnings, datetime
 from datetime import date, timedelta
 import matplotlib
 matplotlib.use("Agg")
@@ -36,6 +36,9 @@ st.markdown("""
 html, body, .stApp { background:#000 !important; color:#e0e0e0 !important; }
 .block-container { padding-top:1.2rem !important; max-width:1500px !important; }
 #MainMenu, footer, header { visibility:hidden !important; }
+
+/* Hide sidebar collapse button */
+[data-testid="collapsedControl"] { display: none !important; }
 
 /* Sidebar */
 section[data-testid="stSidebar"] {
@@ -177,13 +180,14 @@ def date_slice(df: pd.DataFrame, s: date, e: date) -> pd.DataFrame:
 #  PIPELINE COMPUTATIONS
 # ════════════════════════════════════════════════════════════
 
-def compute_box(df: pd.DataFrame, hr: int, mins: int) -> pd.DataFrame:
-    """High/low of first `mins` minutes of hour `hr` UTC per calendar date."""
+def compute_box(df: pd.DataFrame, hr: int, start_min: int, duration_mins: int) -> pd.DataFrame:
+    """High/low between start_min and start_min+duration_mins of hour hr UTC per calendar date."""
     d = df.copy()
-    d["_dt"] = d["ts"].dt.date
-    d["_h"]  = d["ts"].dt.hour
-    d["_m"]  = d["ts"].dt.minute
-    sub = d[(d["_h"] == hr) & (d["_m"] < mins)]
+    d["_dt"]  = d["ts"].dt.date
+    d["_tot"] = d["ts"].dt.hour * 60 + d["ts"].dt.minute  # total minutes since midnight
+    start_total = hr * 60 + start_min
+    end_total   = start_total + duration_mins
+    sub = d[(d["_tot"] >= start_total) & (d["_tot"] < end_total)]
     g = sub.groupby("_dt").agg(
         box_high=("high","max"), box_low=("low","min"),
         box_open=("open","first"),
@@ -192,8 +196,8 @@ def compute_box(df: pd.DataFrame, hr: int, mins: int) -> pd.DataFrame:
     return g.reset_index(drop=True)
 
 def compute_measurements(df: pd.DataFrame, box: pd.DataFrame,
-                          hr: int, mins: int, direction: str,
-                          holds: list) -> pd.DataFrame:
+                          hr: int, start_min: int, duration_mins: int,
+                          direction: str, holds: list) -> pd.DataFrame:
     """
     For each day and hold period, measure MAE and MFE (pips)
     from box_high (short) and/or box_low (long).
@@ -205,7 +209,9 @@ def compute_measurements(df: pd.DataFrame, box: pd.DataFrame,
     for _, row in box.iterrows():
         d = row["date"]
         bh, bl = row["box_high"], row["box_low"]
-        box_end = pd.Timestamp(str(d), tz="UTC") + pd.Timedelta(hours=hr, minutes=mins)
+        box_end = pd.Timestamp(str(d), tz="UTC") + pd.Timedelta(
+            hours=hr, minutes=start_min + duration_mins
+        )
 
         # daily range for regime labelling
         day_mask = idx.index.date == d
@@ -275,7 +281,6 @@ def simulate(meas: pd.DataFrame, stop: float, target: float, queen: float,
         hit_q   = mfe >= queen
 
         if stopped and hit_tgt:
-            # Conservative: stop first if MAE ratio > MFE ratio
             pnl    = -stop if (mae/stop) > (mfe/target) else target
             outcome = "loss" if pnl < 0 else "win"
         elif stopped:
@@ -283,11 +288,10 @@ def simulate(meas: pd.DataFrame, stop: float, target: float, queen: float,
         elif hit_tgt:
             pnl, outcome = target, "win"
         else:
-            # Held to close: use remaining MFE minus proportional adverse
             pnl = mfe * 0.35 - mae * 0.65
             outcome = "scratch"
 
-        pnl -= spread   # cost per trade (spread)
+        pnl -= spread
         rows.append({"date":r["date"],"direction":r["direction"],
                      "hold":r["hold"],"regime":r.get("regime","all"),
                      "mae":mae,"mfe":mfe,"pnl":pnl,"outcome":outcome})
@@ -337,7 +341,7 @@ def run_gates(meas: pd.DataFrame, trades: pd.DataFrame, g: dict,
                    "label":"GATE 0  —  CORRECTNESS",
                    "detail":f"N={g.get('n',0)} (need 100+)  |  PF={g.get('profit_factor',0):.2f} (need >1.0)"}
 
-    # G2 — Perturbation (5-pip shift on stop and target)
+    # G2 — Perturbation
     pv = []
     for ds, dt in [(-5,0),(5,0),(0,-5),(0,5)]:
         t2 = simulate(meas, max(stop+ds, 1), max(target+dt, 1), queen, spread)
@@ -424,8 +428,27 @@ with st.sidebar:
         tf       = "1m"; sym_path = "uploaded"; years = ()
 
     st.markdown('<div class="sec">Fixed Constant</div>', unsafe_allow_html=True)
-    sess_hr   = st.slider("Session Hour (UTC)", 0, 23, 8)
-    box_mins  = st.slider("Box Duration (min)",  1, 60,  5)
+    st.markdown('<p style="font-size:9px;color:#444;letter-spacing:.1em;text-transform:uppercase;margin-bottom:4px;">Box Window (UTC)</p>', unsafe_allow_html=True)
+    tc1, tc2 = st.columns(2)
+    box_start_t = tc1.time_input("Start", value=datetime.time(8, 0))
+    box_end_t   = tc2.time_input("End",   value=datetime.time(8, 5))
+
+    sess_hr   = box_start_t.hour
+    sess_min  = box_start_t.minute
+    box_mins  = int(
+        (box_end_t.hour * 60 + box_end_t.minute) -
+        (box_start_t.hour * 60 + box_start_t.minute)
+    )
+    box_mins = max(box_mins, 1)
+
+    # Display the resolved window for confirmation
+    st.markdown(
+        f'<div style="font-size:9px;color:#3d3d3d;margin-top:4px;">'
+        f'{box_start_t.strftime("%H:%M")} → {box_end_t.strftime("%H:%M")} UTC  '
+        f'({box_mins} min)</div>',
+        unsafe_allow_html=True
+    )
+
     direction = st.selectbox("Direction", ["both","short","long"])
 
     st.markdown('<div class="sec">Forward Test</div>', unsafe_allow_html=True)
@@ -562,7 +585,7 @@ with tabs[1]:
         st.markdown('<div class="sec">Fixed Constant Preview</div>', unsafe_allow_html=True)
         if st.button("COMPUTE BOX LEVELS"):
             with st.spinner("Computing…"):
-                b = compute_box(train_df, sess_hr, box_mins)
+                b = compute_box(train_df, sess_hr, sess_min, box_mins)
                 st.session_state["box"] = b
 
         box = st.session_state.get("box")
@@ -572,14 +595,16 @@ with tabs[1]:
             c2.metric("Avg Box Range", f"{box['box_range'].mean():.1f} pips")
             c3.metric("Max Box Range", f"{box['box_range'].max():.1f} pips")
 
-            # Box range distribution
             fig, ax = plt.subplots(figsize=(10,3.5))
             ax.hist(box["box_range"].clip(upper=box["box_range"].quantile(0.98)),
                     bins=60, color="#e0e0e0", edgecolor="none", alpha=0.9)
             ax.axvline(box["box_range"].median(), color="#666", linestyle="--",
                        linewidth=1, label=f"Median {box['box_range'].median():.1f}")
             ax.set_xlabel("Box Range (pips)")
-            ax.set_title(f"Fixed Constant — Box Range Distribution  |  {sess_hr:02d}:{box_mins:02d} UTC")
+            ax.set_title(
+                f"Fixed Constant — Box Range Distribution  |  "
+                f"{box_start_t.strftime('%H:%M')} → {box_end_t.strftime('%H:%M')} UTC"
+            )
             ax.legend(); ax.grid(True, alpha=0.3)
             plt.tight_layout(); st.pyplot(fig); plt.close(fig)
 
@@ -603,7 +628,7 @@ with tabs[2]:
 
         if st.button("RUN MEASUREMENT"):
             prog = st.progress(0, "Measuring MAE / MFE…")
-            meas = compute_measurements(train_df, box, sess_hr, box_mins,
+            meas = compute_measurements(train_df, box, sess_hr, sess_min, box_mins,
                                          direction, [1,2,3])
             prog.progress(70, "Labelling regimes…")
             meas = add_regime(meas)
@@ -629,7 +654,6 @@ with tabs[2]:
                 "90D": all_dates[-63:]  if n >= 63  else all_dates,
             }
 
-            # ── Percentile tables ──
             st.markdown('<div class="sec">Percentile Tables — MAE and MFE (pips)</div>',
                         unsafe_allow_html=True)
             for hold in [1,2,3]:
@@ -648,7 +672,6 @@ with tabs[2]:
                     st.dataframe(pd.DataFrame(pct_rows).set_index("Window"),
                                  use_container_width=True)
 
-            # ── Distributions ──
             st.markdown('<div class="sec">Distributions</div>', unsafe_allow_html=True)
             h_sel = st.select_slider("Hold Period", [1,2,3], value=1)
             hd = m[m["hold"] == h_sel]
@@ -667,7 +690,6 @@ with tabs[2]:
                     ax.set_xlabel("pips"); ax.legend(); ax.grid(True,alpha=0.3)
                 plt.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-            # ── Box range vs MAE scatter ──
             st.markdown('<div class="sec">Box Range vs 1H MAE</div>', unsafe_allow_html=True)
             h1 = m[m["hold"]==1]
             if len(h1) > 10:
@@ -728,7 +750,6 @@ with tabs[3]:
                 st.dataframe(pd.DataFrame(rho_rows).set_index("Window"),
                              use_container_width=True)
 
-            # Growth chart
             if rho_vals:
                 fig, ax = plt.subplots(figsize=(10,3.8))
                 colors = {"Five Year":"#e0e0e0","One Year":"#777","Ninety Day":"#333"}
@@ -745,7 +766,6 @@ with tabs[3]:
                 ax.legend(loc="upper left", fontsize=7); ax.grid(True, alpha=0.3)
                 plt.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-                # 1Y rho callout
                 r1y = rho_vals.get("One Year", list(rho_vals.values())[-1])
                 st.markdown(f"""
                 <div class="kpi" style="margin-top:14px;max-width:340px;">
@@ -787,7 +807,6 @@ with tabs[4]:
             for hold in [1,2,3]:
                 hw = m1y[(m1y["regime"]==rg) & (m1y["hold"]==hold)]
                 if len(hw) < 10: continue
-                # compute rho vs 1h baseline
                 h1 = m1y[(m1y["regime"]==rg) & (m1y["hold"]==1)]
                 if hold > 1 and len(h1) > 0 and h1["mae"].median() > 0:
                     rho = (hw["mae"].median() / h1["mae"].median()) / \
@@ -806,7 +825,6 @@ with tabs[4]:
         if reg_rows:
             st.dataframe(pd.DataFrame(reg_rows), use_container_width=True)
 
-        # Distribution comparison
         st.markdown('<div class="sec">MAE / MFE Distribution by Regime — 1H Hold</div>',
                     unsafe_allow_html=True)
         h_data = m1y[m1y["hold"]==1]
@@ -926,7 +944,6 @@ with tabs[5]:
                   </div>
                 </div>""", unsafe_allow_html=True)
 
-                # PF Heatmap
                 st.markdown('<div class="sec">Profit Factor Heatmap — Stop vs Target</div>',
                             unsafe_allow_html=True)
                 hm = (rdf.groupby(["Stop","Target"])["_pf"]
@@ -992,7 +1009,6 @@ with tabs[6]:
             gates = val["gates"]
             trades= val["trades"]
 
-            # Grade card
             st.markdown('<div class="sec">Grade Card</div>', unsafe_allow_html=True)
             c1,c2,c3,c4 = st.columns(4)
             c1.metric("N Trades",      g["n"])
@@ -1005,7 +1021,6 @@ with tabs[6]:
             c7.metric("Max DD pips",   f"{g['max_dd']:.1f}")
             c8.metric("Kelly",         f"{g['kelly']:.3f}")
 
-            # Gates
             st.markdown('<div class="sec">Seven-Gate Stress Test</div>', unsafe_allow_html=True)
             passed = 0; crit_fail = False
             for gid, gdata in gates.items():
@@ -1024,7 +1039,6 @@ with tabs[6]:
                   <div style="font-size:9.5px;color:#4d4d4d;margin-top:5px;">{gdata['detail']}</div>
                 </div>""", unsafe_allow_html=True)
 
-            # Verdict
             ok_color = "#e0e0e0" if not crit_fail else "#555"
             verdict  = f"DEPLOY — {passed}/{len(gates)} gates passed" if not crit_fail \
                        else f"REJECT — critical gate failed  ({passed}/{len(gates)} passed)"
@@ -1035,7 +1049,6 @@ with tabs[6]:
               <div style="font-size:17px;font-weight:700;color:{ok_color};">{verdict}</div>
             </div>""", unsafe_allow_html=True)
 
-            # Equity curve
             st.markdown('<div class="sec">Equity Curve</div>', unsafe_allow_html=True)
             ts = trades.sort_values("date").copy()
             ts["cum"] = ts["pnl"].cumsum()
@@ -1051,7 +1064,6 @@ with tabs[6]:
             ax.grid(True, alpha=0.25)
             plt.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-            # Rolling win rate
             st.markdown('<div class="sec">Rolling Win Rate (30-trade window)</div>',
                         unsafe_allow_html=True)
             ts["win_i"] = (ts["outcome"]=="win").astype(int)
@@ -1100,8 +1112,8 @@ with tabs[7]:
                 if len(fwd_df) < 200:
                     st.warning(f"Only {len(fwd_df)} rows in forward period.")
 
-                fwd_box  = compute_box(fwd_df, sess_hr, box_mins)
-                fwd_meas = compute_measurements(fwd_df, fwd_box, sess_hr, box_mins,
+                fwd_box  = compute_box(fwd_df, sess_hr, sess_min, box_mins)
+                fwd_meas = compute_measurements(fwd_df, fwd_box, sess_hr, sess_min, box_mins,
                                                  bc["direction"], [bc["hold"]])
                 fwd_meas = add_regime(fwd_meas)
                 fwd_meas = fwd_meas[fwd_meas["direction"]==bc["direction"]]
@@ -1112,7 +1124,6 @@ with tabs[7]:
 
                 train_grade = bc["grade"]
 
-                # Comparison
                 st.markdown('<div class="sec">In-Sample vs Out-of-Sample</div>',
                             unsafe_allow_html=True)
                 cols = st.columns(5)
@@ -1125,7 +1136,6 @@ with tabs[7]:
                     col.metric(f"{lbl}", fmt.format(ov),
                                delta=fmt.format(ov-iv))
 
-                # Equity curves side by side
                 st.markdown('<div class="sec">Equity Curves</div>', unsafe_allow_html=True)
                 val_res = st.session_state.get("val_res")
                 fig, axes = plt.subplots(1,2,figsize=(14,4))
@@ -1150,7 +1160,6 @@ with tabs[7]:
                     ax.grid(True, alpha=0.25)
                 plt.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-                # Regime breakdown
                 st.markdown('<div class="sec">Forward Period — Regime Breakdown</div>',
                             unsafe_allow_html=True)
                 rg_rows = []
@@ -1168,7 +1177,6 @@ with tabs[7]:
                 if rg_rows:
                     st.dataframe(pd.DataFrame(rg_rows), use_container_width=True)
 
-                # Win rate comparison chart
                 st.markdown('<div class="sec">Box Range vs MAE — Forward Period</div>',
                             unsafe_allow_html=True)
                 h1f = fwd_meas[fwd_meas["hold"]==bc["hold"]]
